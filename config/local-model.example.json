@@ -1,0 +1,18 @@
+{
+  "server_path": "D:\\ReachyAI\\runtime\\llama.cpp\\bin\\llama-server.exe",
+  "model_path": "D:\\ReachyAI\\models\\local-model.gguf",
+  "mmproj_path": "D:\\ReachyAI\\models\\mmproj.gguf",
+  "alias": "local-model",
+  "host": "127.0.0.1",
+  "port": 11435,
+  "context_size": 16384,
+  "gpu_layers": 99,
+  "flash_attention": true,
+  "cache_type_k": "q4_0",
+  "cache_type_v": "q4_0",
+  "parallel": 1,
+  "image_min_tokens": 1024,
+  "image_max_tokens": 1024,
+  "mmproj_offload": true,
+  "reasoning_budget": 0
+}

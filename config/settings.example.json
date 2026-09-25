@@ -1,0 +1,41 @@
+{
+  "listen_host": "127.0.0.1",
+  "listen_port": 8077,
+  "models": [
+    {
+      "id": "local-qwen9b",
+      "name": "本机 Qwen 9B",
+      "base_url": "http://127.0.0.1:11435/v1",
+      "model": "qwen3.5-9b",
+      "api_key_env": "REACHY_LOCAL_API_KEY",
+      "timeout_seconds": 120,
+      "max_tokens": 1024,
+      "temperature": 0.7,
+      "extra_body": {"chat_template_kwargs": {"enable_thinking": false}}
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek 云端",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "timeout_seconds": 300,
+      "max_tokens": 2048,
+      "temperature": 0.6,
+      "extra_body": {}
+    }
+  ],
+  "router": {
+    "default_model_id": "local-qwen9b",
+    "cloud_model_id": "deepseek",
+    "confidence_threshold": 0.68,
+    "classify_timeout_seconds": 30,
+    "long_input_chars": 1600
+  },
+  "agent": {
+    "history_token_budget": 49152,
+    "cloud_history_token_budget": 900000,
+    "history_max_messages": 5000
+  },
+  "identity": {"family_mode": true}
+}
