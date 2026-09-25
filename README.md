@@ -1,4 +1,4 @@
-# Reachy Mini Family Agent / Reachy Mini 家庭机器人 Agent
+# Reachy Mini Lite Family Agent / Reachy Mini 家庭机器人 Agent
 
 [中文](#中文) · [English](#english)
 
