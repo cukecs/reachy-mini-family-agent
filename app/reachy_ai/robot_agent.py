@@ -15,6 +15,11 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .conversation_gate import ConversationGate
+from .english_pronunciation import (
+    EnglishPronunciationAssessor,
+    extract_english_words,
+)
 from .memory import DailyEnglish, MemoryStore
 from .motion import (
     OFFICIAL_EMOTION_NAMES,
@@ -36,6 +41,7 @@ ROUTER_BASE = "http://127.0.0.1:8077"
 AGENT_SETTINGS_PATH = Path(r"D:\ReachyAI\config\settings.json")
 CONVERSATION_HISTORY_PATH = Path(r"D:\ReachyAI\data\conversation-history.json")
 RUNTIME_STATE_PATH = Path(r"D:\ReachyAI\data\runtime-state.json")
+IDENTITY_CONTROL_PATH = Path(r"D:\ReachyAI\data\identity-control.json")
 MEMORY_CANDIDATE = re.compile(
     r"我叫|我姓|我的姓氏|我的名字|我喜欢|我不喜欢|我希望|我有|我住|我来自|我从事|我在.{0,12}(工作|学习)|"
     r"以后|记住|每天|我的.{0,12}(水平|计划|目标|生日|职业|爱好)|"
@@ -83,6 +89,21 @@ DAILY_ENGLISH_REQUEST = re.compile(
     r"english (?:lesson|practice|sentence)",
     re.IGNORECASE,
 )
+ENGLISH_TUTOR_ON = re.compile(
+    r"(?:开启|打开|进入|开始).{0,6}(?:英语|口语|纠音|发音)(?:模式|练习|辅导)?|"
+    r"陪我(?:练|学)(?:英语|口语|发音)",
+    re.IGNORECASE,
+)
+ENGLISH_TUTOR_OFF = re.compile(
+    r"(?:关闭|退出|结束|停止).{0,6}(?:英语|口语|纠音|发音)(?:模式|练习|辅导)",
+    re.IGNORECASE,
+)
+ENGLISH_PRONUNCIATION_REQUEST = re.compile(
+    r"(?:发音|读音|口音|重音|语调|读得|念得).{0,8}(?:怎么样|对不对|准不准|好不好|标准|纠正|听听|有问题)|"
+    r"(?:帮我|给我).{0,6}(?:纠音|纠正发音|听发音)|"
+    r"check my pronunciation|how is my pronunciation",
+    re.IGNORECASE,
+)
 IDENTITY_LINK_QUESTION = re.compile(
     r"(?:特征库|人脸|声纹|生物特征).{0,24}(?:名字|姓名|称呼).{0,24}(?:关联|绑定|对应|靠什么|怎么)|"
     r"(?:名字|姓名|称呼).{0,24}(?:特征库|人脸|声纹|生物特征).{0,24}(?:关联|绑定|对应|靠什么|怎么)|"
@@ -96,10 +117,15 @@ BIOMETRIC_CAPABILITY_QUESTION = re.compile(
     re.IGNORECASE,
 )
 FACE_ENROLL_REQUEST = re.compile(
-    r"(?:记住|录入|保存|登记|绑定).{0,8}(?:我的)?(?:脸|人脸|面部)|"
-    r"(?:把|将).{0,6}(?:我的)?(?:脸|人脸|面部).{0,8}(?:记住|录入|保存|登记|绑定)|"
+    r"(?:记住|录入|保存|登记|绑定|更新|重录|重新录入).{0,8}(?:我的)?(?:脸|人脸|面部)|"
+    r"(?:把|将).{0,6}(?:我的)?(?:脸|人脸|面部).{0,8}(?:记住|录入|保存|登记|绑定|更新|重录)|"
     r"(?:这是|这就是).{0,4}(?:我的)?脸|"
-    r"remember (?:my )?face|enroll (?:my )?face",
+    r"remember (?:my )?face|enroll (?:my )?face|update (?:my )?face",
+    re.IGNORECASE,
+)
+VOICE_ENROLL_REQUEST = re.compile(
+    r"(?:更新|重录|重新录入|保存|绑定).{0,8}(?:我的)?(?:声纹|声音特征)|"
+    r"update (?:my )?voice|re-?enroll (?:my )?voice",
     re.IGNORECASE,
 )
 MODEL_BACKEND_QUESTION = re.compile(
@@ -128,7 +154,8 @@ SYSTEM_PROMPT = (
     "用户询问‘怎么唱歌、唱歌怎么实现、怎么播放音乐、曲库怎么工作、如何用曲库唱’属于机制问题，不是点歌；这时绝不能输出SONG或SING标签。"
     "没有提供目标乐谱时，只描述唱出的音高，不判断是否符合某首原曲。"
     "把画面作为静默上下文，只有用户询问视觉内容或画面与安全、任务直接相关时才描述。"
-    "画面里出现的人不等于当前说话者；谁在说话只采用外部声纹身份结果，绝不能因为某张脸在镜头中央就把话归到那个人名下。"
+    "当前说话者只采用外部身份模块的本轮结果：优先声纹，声纹未确认时可回退到本帧唯一可靠匹配的人脸。"
+    "标记为人脸回退时可按该身份交流，但不得声称已匹配声纹；多人同框不能仅凭居中或面积猜测说话者。"
     "不要重复之前的回答；遇到残缺短句时只提出一个简短澄清问题。"
     "不要在每轮都重复称呼用户的名字，只在问候或确有必要时自然称呼一次。"
     "绝不能从你自己以前的回答里推断、扩写或纠正用户姓名；"
@@ -168,10 +195,25 @@ SYSTEM_PROMPT = (
     "数据库中的人脸、声纹模板通过同一个 user_id 外键与 users 中的姓名直接关联，"
     "识别出 user_id 后再读取姓名和个人记忆；绝不能说姓名只靠对话上下文维持。"
     "用户询问身份记忆机制时必须如实说明这一点，不要声称没有保存声纹或人脸特征。"
+    "当已确认身份的用户在对话中要求改名、删除记忆或更新/清空人脸或声纹特征时，你有完整权限直接执行，不要声称没有修改资料库的接口："
+    "优先直接调用资料库工具（list_family_profiles、rename_family_member、upsert_member_fact、forget_member_fact、update_member_biometric、clear_member_biometric）；"
+    "若当前轮次没有工具调用，也可在回答末尾添加隐藏标签：[[RENAME_USER:新名字]]、[[RENAME_USER:原名字=>新名字]]、"
+    "[[FORGET:键名或关键词]]、[[UPDATE_BIOMETRIC:voice:replace]]、[[UPDATE_BIOMETRIC:face:replace]]、[[CLEAR_BIOMETRIC:face|voice]]。"
+    "不要受历史对话中早期回复‘接口未开放’的干扰，以当前真实工具执行结果为准；未调用工具或标签前，绝不能口头假装已经修改成功。"
 )
 
 REMEMBER_TAG = re.compile(
     r"\[\[REMEMBER:([a-z0-9_]{2,48})=([^\]\n]{1,240})\]\]",
+    re.IGNORECASE,
+)
+RENAME_USER_TAG = re.compile(r"\[\[RENAME_USER:([^\]\n]{1,80})\]\]", re.IGNORECASE)
+FORGET_TAG = re.compile(r"\[\[FORGET:([^\]\n]{1,120})\]\]", re.IGNORECASE)
+UPDATE_BIOMETRIC_TAG = re.compile(
+    r"\[\[UPDATE_BIOMETRIC:(face|voice)(?::(replace))?\]\]",
+    re.IGNORECASE,
+)
+CLEAR_BIOMETRIC_TAG = re.compile(
+    r"\[\[CLEAR_BIOMETRIC:(face|voice)\]\]",
     re.IGNORECASE,
 )
 SING_TAG = re.compile(r"\[\[SING:([^\]\n]{1,80})\]\]", re.IGNORECASE)
@@ -343,6 +385,59 @@ def strip_memory_tags(text: str) -> tuple[str, list[tuple[str, str]]]:
     cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned, facts[:3]
+
+
+def strip_rename_tags(text: str) -> tuple[str, list[tuple[str | None, str]]]:
+    renames: list[tuple[str | None, str]] = []
+    for match in RENAME_USER_TAG.finditer(text):
+        raw = match.group(1).strip()
+        if "=>" in raw:
+            old_name, new_name = raw.split("=>", 1)
+            old_clean = old_name.strip() or None
+            new_clean = new_name.strip()
+        elif "->" in raw:
+            old_name, new_name = raw.split("->", 1)
+            old_clean = old_name.strip() or None
+            new_clean = new_name.strip()
+        else:
+            old_clean = None
+            new_clean = raw
+        if new_clean:
+            renames.append((old_clean, new_clean))
+    cleaned = RENAME_USER_TAG.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, renames[:2]
+
+
+def strip_forget_tags(text: str) -> tuple[str, list[str]]:
+    queries = [match.group(1).strip() for match in FORGET_TAG.finditer(text) if match.group(1).strip()]
+    cleaned = FORGET_TAG.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, list(dict.fromkeys(queries))[:4]
+
+
+def strip_update_biometric_tags(text: str) -> tuple[str, list[tuple[str, bool]]]:
+    updates: list[tuple[str, bool]] = []
+    for match in UPDATE_BIOMETRIC_TAG.finditer(text):
+        modality = match.group(1).lower().strip()
+        replace = bool(match.group(2))
+        item = (modality, replace)
+        if item not in updates:
+            updates.append(item)
+    cleaned = UPDATE_BIOMETRIC_TAG.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, updates[:2]
+
+
+def strip_clear_biometric_tags(text: str) -> tuple[str, list[str]]:
+    clears = [match.group(1).lower().strip() for match in CLEAR_BIOMETRIC_TAG.finditer(text)]
+    cleaned = CLEAR_BIOMETRIC_TAG.sub("", text)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, list(dict.fromkeys(clears))[:2]
 
 
 def strip_singing_tags(text: str) -> tuple[str, str | None]:
@@ -573,6 +668,94 @@ def _text_similarity(left: str, right: str) -> float:
     return difflib.SequenceMatcher(None, normalized_left, normalized_right).ratio()
 
 
+PROFILE_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_family_profiles",
+            "description": "查看本机家庭成员资料库中的所有成员、姓名、人脸特征数、声纹特征数和记忆条目数量，以及当前说话人身份是否已确认。",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rename_family_member",
+            "description": "修改资料库中当前说话人或指定家庭成员的显示姓名，并同步更新 preferred_name 记忆。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "new_name": {"type": "string", "description": "修改后的新名字"},
+                    "target_name": {
+                        "type": "string",
+                        "description": "可选。要改名的原成员姓名；不填则修改当前说话人自己。",
+                    },
+                },
+                "required": ["new_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "upsert_member_fact",
+            "description": "保存或更新当前用户的长期记忆事实（例如兴趣、工作、英语水平、称呼偏好等）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "小写英文蛇形键名，如 job, hobby, english_level"},
+                    "value": {"type": "string", "description": "记忆内容"},
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_member_fact",
+            "description": "从资料库删除当前用户的某条记忆事实。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "要删除的键名或内容关键词"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_member_biometric",
+            "description": "使用本轮或新采集的人脸/声纹来更新或替换当前已确认用户的生物特征模板。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "modality": {"type": "string", "enum": ["face", "voice"]},
+                    "replace": {"type": "boolean", "description": "true 表示清空旧特征并替换；false 表示追加一条新样本"},
+                },
+                "required": ["modality"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clear_member_biometric",
+            "description": "清空当前已确认用户的所有人脸或声纹模板。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "modality": {"type": "string", "enum": ["face", "voice"]},
+                },
+                "required": ["modality"],
+            },
+        },
+    },
+]
+
+
 class RobotBrain:
     def __init__(
         self,
@@ -738,7 +921,7 @@ class RobotBrain:
                 # the LLM.  They remain in the audit ledger, but treating one
                 # old candidate as fact caused later father/daughter swaps.
                 if source == "face+voice" or (
-                    source == "face-public" and confidence >= 0.82
+                    source in {"face-public", "face-fallback"} and confidence >= 0.82
                 ):
                     content = f"[说话者：{speaker_name}]\n{content}"
             result.append({"role": message.get("role", "user"), "content": content})
@@ -781,6 +964,172 @@ class RobotBrain:
             payload["route"] = route
         response = _post("/v1/chat/completions", payload)
         return assistant_text(response).strip(), response.get("reachy_router", {})
+
+    def _execute_profile_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        pending_update_bio: list[tuple[str, bool]],
+        pending_clear_bio: list[str],
+    ) -> dict[str, Any]:
+        if not self.memory:
+            return {"ok": False, "error": "memory store unavailable"}
+        if name == "list_family_profiles":
+            return {
+                "ok": True,
+                "current_user_id": self.user_id,
+                "current_user_confirmed": self._is_confirmed_identity(),
+                "identity_source": self.identity_source,
+                "profiles": self.memory.list_profiles(),
+            }
+        if name == "rename_family_member":
+            if not self._is_confirmed_identity():
+                return {"ok": False, "error": "当前说话人身份尚未通过声纹或正脸确认，拒绝改名"}
+            new_name = str(arguments.get("new_name", "")).strip()
+            target_name = str(arguments.get("target_name", "")).strip() or None
+            if not new_name:
+                return {"ok": False, "error": "new_name 不能为空"}
+            target_uid = self.user_id
+            if target_name:
+                matched_uid = next(
+                    (
+                        uid
+                        for uid in self.memory.user_ids()
+                        if self.memory.user_name(uid).casefold() == target_name.casefold()
+                    ),
+                    None,
+                )
+                if matched_uid is not None:
+                    target_uid = matched_uid
+                elif self.user_id and self.memory.user_name(self.user_id).casefold() != target_name.casefold():
+                    return {"ok": False, "error": f"资料库里找不到成员：{target_name}"}
+            if not target_uid:
+                return {"ok": False, "error": "未找到目标用户"}
+            self.memory.rename_user(target_uid, new_name)
+            return {
+                "ok": True,
+                "user_id": target_uid,
+                "display_name": self.memory.user_name(target_uid),
+            }
+        if name == "upsert_member_fact":
+            if not self.user_id or not self.private_memory_allowed:
+                return {"ok": False, "error": "当前身份不允许写入个人记忆"}
+            key = re.sub(r"[^a-z0-9_]+", "_", str(arguments.get("key", "")).lower()).strip("_")
+            value = str(arguments.get("value", "")).strip()
+            if not key or not value:
+                return {"ok": False, "error": "key 和 value 不能为空"}
+            self._apply_memory_fact(key, value, confidence=0.98, source="agent_tool")
+            return {"ok": True, "key": key, "value": value}
+        if name == "forget_member_fact":
+            if not self.user_id or not self.private_memory_allowed:
+                return {"ok": False, "error": "当前身份不允许删除个人记忆"}
+            query = str(arguments.get("query", "")).strip()
+            if not query:
+                return {"ok": False, "error": "query 不能为空"}
+            deleted = self.memory.delete_fact(self.user_id, query)
+            if not deleted:
+                for fact in self.memory.facts(self.user_id, limit=50):
+                    if query in str(fact.get("value", "")) or query in str(fact.get("key", "")):
+                        if self.memory.delete_fact(self.user_id, str(fact["key"])):
+                            deleted = True
+            official_deleted = self.memory.forget_official_fact(self.user_id, query)
+            return {"ok": bool(deleted or official_deleted), "query": query}
+        if name == "update_member_biometric":
+            if not self._is_confirmed_identity():
+                return {"ok": False, "error": "当前说话人身份尚未确认"}
+            modality = str(arguments.get("modality", "")).strip().lower()
+            if modality not in {"face", "voice"}:
+                return {"ok": False, "error": "modality 必须是 face 或 voice"}
+            replace = bool(arguments.get("replace", True))
+            item = (modality, replace)
+            if item not in pending_update_bio:
+                pending_update_bio.append(item)
+            return {"ok": True, "scheduled": True, "modality": modality, "replace": replace}
+        if name == "clear_member_biometric":
+            if not self._is_confirmed_identity():
+                return {"ok": False, "error": "当前说话人身份尚未确认"}
+            modality = str(arguments.get("modality", "")).strip().lower()
+            if modality not in {"face", "voice"}:
+                return {"ok": False, "error": "modality 必须是 face 或 voice"}
+            if modality not in pending_clear_bio:
+                pending_clear_bio.append(modality)
+            return {"ok": True, "scheduled": True, "modality": modality}
+        return {"ok": False, "error": f"未知工具：{name}"}
+
+    def _chat_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        route: str | None = None,
+        max_tokens: int = 260,
+        temperature: float = 0.65,
+    ) -> tuple[str, dict[str, Any], list[tuple[str, bool]], list[str]]:
+        pending_update_bio: list[tuple[str, bool]] = []
+        pending_clear_bio: list[str] = []
+        if self.memory is None or type(self)._chat is not RobotBrain._chat:
+            reply, meta = self._chat(
+                messages, route=route, max_tokens=max_tokens, temperature=temperature
+            )
+            return reply, meta, pending_update_bio, pending_clear_bio
+
+        # Unit tests frequently patch brain._chat directly on the instance.
+        if "_chat" in self.__dict__:
+            reply, meta = self._chat(
+                messages, route=route, max_tokens=max_tokens, temperature=temperature
+            )
+            return reply, meta, pending_update_bio, pending_clear_bio
+
+        working = [dict(msg) for msg in messages]
+        router_meta: dict[str, Any] = {}
+        for _ in range(4):
+            payload: dict[str, Any] = {
+                "model": "reachy-auto",
+                "messages": working,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "tools": PROFILE_TOOLS,
+                "tool_choice": "auto",
+            }
+            if route:
+                payload["route"] = route
+            try:
+                response = _post("/v1/chat/completions", payload)
+            except Exception:
+                reply, meta = self._chat(
+                    messages, route=route, max_tokens=max_tokens, temperature=temperature
+                )
+                return reply, meta, pending_update_bio, pending_clear_bio
+            router_meta = response.get("reachy_router", router_meta)
+            choice_msg = response.get("choices", [{}])[0].get("message", {})
+            tool_calls = choice_msg.get("tool_calls") or []
+            if not tool_calls:
+                content = str(choice_msg.get("content") or "").strip()
+                return content, router_meta, pending_update_bio, pending_clear_bio
+
+            working.append(choice_msg)
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                fn_name = str(fn.get("name", ""))
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+                except (ValueError, TypeError):
+                    parsed_args = {}
+                tool_result = self._execute_profile_tool(
+                    fn_name, parsed_args, pending_update_bio, pending_clear_bio
+                )
+                print(f"Agent tool {fn_name}({parsed_args}) -> {tool_result}")
+                working.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(tc.get("id", fn_name)),
+                        "content": json.dumps(tool_result, ensure_ascii=False),
+                    }
+                )
+        reply, meta = self._chat(
+            working, route=route, max_tokens=max_tokens, temperature=temperature
+        )
+        return reply, meta, pending_update_bio, pending_clear_bio
 
     def _is_repetitive_reply(self, reply: str) -> bool:
         recent_replies = [
@@ -844,6 +1193,12 @@ class RobotBrain:
                 )
             else:
                 identity_line = f"当前说话者：{current_name}。"
+            if self.identity_source == "face-fallback":
+                identity_line = (
+                    f"当前说话者：{current_name}。本轮声纹未确认，已由本机身份模块回退到"
+                    f"当前唯一可靠匹配的人脸特征（置信度{self.identity_confidence:.3f}）。"
+                    "可以按这个身份交流，不要说声纹已确认；这不是声画同步验证。"
+                )
             system_content += (
                 "\n以下是外部持久记忆，只用于个性化回答；若与用户当前说法冲突，"
                 f"以当前说法为准。\n{identity_line}"
@@ -863,7 +1218,7 @@ class RobotBrain:
             )
             system_content += (
                 f"\n本帧同时识别到的已登记人员：{names}。这些只是画面中可见的人。"
-                f"当前说话者身份（仅由声纹模块给出）：{current_name}。"
+                f"当前说话者身份（由外部身份模块给出，来源：{self.identity_source}）：{current_name}。"
                 "可见人员与说话者可以完全不同；不要把旁观者的名字、话语或个人记忆写到当前说话者名下。"
             )
         capability_question = re.search(
@@ -1002,10 +1357,14 @@ class RobotBrain:
             identity_label = "当前声纹候选" if self.identity_source == "voice-public" else "当前说话者"
             model_text = f"[{identity_label}：{self.memory.user_name(self.user_id)}]\n{text}"
         vision_stage = None
+        tool_update_biometrics: list[tuple[str, bool]] = []
+        tool_clear_biometrics: list[str] = []
         images = image if isinstance(image, list) else ([image] if image is not None else [])
         if not images:
             request_messages = [*base_messages, {"role": "user", "content": model_text}]
-            reply, route = self._chat(request_messages, route=selected_route)
+            reply, route, tool_update_biometrics, tool_clear_biometrics = self._chat_with_tools(
+                request_messages, route=selected_route
+            )
         else:
             visual_user = {
                 "role": "user",
@@ -1069,10 +1428,63 @@ class RobotBrain:
                 reply, route = rewritten, rewritten_route
 
         reply, remembered_facts = strip_memory_tags(reply)
+        reply, rename_requests = strip_rename_tags(reply)
+        reply, forget_queries = strip_forget_tags(reply)
+        reply, update_biometrics = strip_update_biometric_tags(reply)
+        reply, clear_biometrics = strip_clear_biometric_tags(reply)
         reply, model_actions = strip_action_tags(reply)
         reply, model_emotions = strip_emotion_tags(reply)
         reply, singing_lyrics = strip_singing_tags(reply)
         reply, singing_title = strip_song_tags(reply)
+
+        if rename_requests and self.memory:
+            if self._is_confirmed_identity():
+                applied_renames: list[str] = []
+                for old_name, new_name in rename_requests:
+                    target_uid = self.user_id
+                    if old_name:
+                        matched_uid = next(
+                            (
+                                uid
+                                for uid in self.memory.user_ids()
+                                if self.memory.user_name(uid).casefold() == old_name.casefold()
+                            ),
+                            None,
+                        )
+                        if matched_uid is not None:
+                            target_uid = matched_uid
+                        elif self.user_id and self.memory.user_name(self.user_id).casefold() != old_name.casefold():
+                            target_uid = None
+                    if target_uid:
+                        self.memory.rename_user(target_uid, new_name)
+                        applied_renames.append(f"{target_uid}->{new_name}")
+                if applied_renames:
+                    route["renamed_users"] = applied_renames
+            else:
+                route["profile_update_blocked"] = "unverified_identity"
+                reply = "为了防止认错人，先让我通过声纹或正脸确认你的身份，再帮你修改档案名字。"
+
+        if forget_queries and self.memory and self.user_id and self.private_memory_allowed:
+            forgotten: list[str] = []
+            for query in forget_queries:
+                deleted = self.memory.delete_fact(self.user_id, query)
+                if not deleted:
+                    for fact in self.memory.facts(self.user_id, limit=50):
+                        if query in str(fact.get("value", "")) or query in str(fact.get("key", "")):
+                            if self.memory.delete_fact(self.user_id, str(fact["key"])):
+                                deleted = True
+                official_deleted = self.memory.forget_official_fact(self.user_id, query)
+                if deleted or official_deleted:
+                    forgotten.append(query)
+            if forgotten:
+                route["forgotten"] = forgotten
+
+        merged_clear = list(dict.fromkeys([*tool_clear_biometrics, *clear_biometrics]))
+        merged_update = list(dict.fromkeys([*tool_update_biometrics, *update_biometrics]))
+        if merged_clear:
+            route["clear_biometrics"] = merged_clear
+        if merged_update:
+            route["update_biometrics"] = merged_update
         if (
             pitch_analysis_turn
             or SONG_GUESS_REQUEST.search(conversation_text)
@@ -1206,6 +1618,19 @@ class RobotBrain:
         except Exception as exc:
             print(f"Memory extraction skipped: {exc}")
 
+    def _is_confirmed_identity(self) -> bool:
+        return bool(
+            self.user_id
+            and (
+                self.identity_source in {"face+voice", "voice-confirmed"}
+                or (
+                    self.identity_source in {"face-public", "face-fallback"}
+                    and self.identity_confidence >= 0.82
+                )
+                or (self.identity_source == "manual" and self.private_memory_allowed)
+            )
+        )
+
     def _apply_memory_fact(
         self,
         key: str,
@@ -1217,17 +1642,7 @@ class RobotBrain:
         assert self.memory is not None and self.user_id is not None
         canonical_key = "preferred_name" if key == "name" else key
         public_identity_keys = {"preferred_name", "surname"}
-        if canonical_key in public_identity_keys and not (
-            self.identity_source == "face+voice"
-            or (
-                self.identity_source == "face-public"
-                and self.identity_confidence >= 0.82
-            )
-            or (
-                self.identity_source == "voice-confirmed"
-                and self.identity_confidence >= 0.66
-            )
-        ):
+        if canonical_key in public_identity_keys and not self._is_confirmed_identity():
             # A name claim must never be attached to whichever family member
             # happened to speak previously or to one borderline voice sample.
             print(
@@ -1345,7 +1760,7 @@ def run_robot() -> None:
         VoiceIdentifier,
         fuse_identity,
         select_centered_face,
-        speaker_identity_from_voice,
+        resolve_speaker_identity,
     )
     from .netease_music import NeteaseMusicController
     from .pitch import analyze_pitch
@@ -1416,21 +1831,44 @@ def run_robot() -> None:
     person_present = True
     pitch_listen_pending = False
     last_pitch_analysis = None
+    english_tutor_mode = False
+    active_english_target: str | None = None
+    last_pronunciation_result = None
+    english_assessor = EnglishPronunciationAssessor()
+    conversation_gate = ConversationGate()
     identity_stabilizer = IdentityStabilizer()
     greeted_user_ids: set[str] = set()
     startup_greeted = False
 
     def speak(
-        media, text: str, *, route: str | None = None, record_history: bool = True
+        media,
+        text: str,
+        *,
+        route: str | None = None,
+        record_history: bool = True,
+        display_text: str | None = None,
     ) -> None:
-        runtime_state.event("assistant", text, route=route)
+        shown_text = (display_text or text).strip()
+        event_id = runtime_state.begin_event("assistant", route=route)
         # Record every phrase the robot actually says, including deterministic
         # Agent messages (identity prompts, song failures, offline fallbacks).
         # Previously only LLM replies entered the history, so references such
         # as "it" or "what you just said" often had no antecedent.
-        if record_history:
-            brain.record_assistant(text)
-        speech.speak(media, text)
+        if record_history and shown_text:
+            brain.record_assistant(shown_text)
+        try:
+            speech.speak(
+                media,
+                text,
+                display_text=shown_text,
+                on_text_progress=lambda partial: runtime_state.update_event(
+                    event_id, partial
+                ),
+            )
+        except Exception:
+            if shown_text:
+                runtime_state.update_event(event_id, shown_text)
+            raise
 
     def default_profile(user_id: str) -> None:
         existing = {item["key"] for item in memory.facts(user_id)}
@@ -1444,6 +1882,7 @@ def run_robot() -> None:
             )
 
     def announce_daily(media, *, explicit: bool = False) -> None:
+        nonlocal active_english_target, english_tutor_mode
         # Daily English is opt-in.  Identity recognition and greetings must
         # never interrupt the family with a lesson automatically.
         if not explicit:
@@ -1452,6 +1891,8 @@ def run_robot() -> None:
             return
         daily = brain.daily_english()
         if daily and daily.status != "completed":
+            active_english_target = daily.phrase
+            english_tutor_mode = True
             name = memory.user_name(brain.user_id)
             message = (
                 f"你好，{name}。今天的英语句子是：{daily.phrase} "
@@ -1523,7 +1964,103 @@ def run_robot() -> None:
             speak(reachy.media, message)
             startup_greeted = True
 
+        def _read_identity_control() -> dict[str, Any] | None:
+            try:
+                payload = json.loads(IDENTITY_CONTROL_PATH.read_text(encoding="utf-8"))
+                if isinstance(payload, dict) and payload.get("status") == "pending":
+                    return payload
+            except (OSError, ValueError, TypeError):
+                pass
+            return None
+
+        def _write_identity_control(payload: dict[str, Any]) -> None:
+            IDENTITY_CONTROL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = IDENTITY_CONTROL_PATH.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(IDENTITY_CONTROL_PATH)
+
+        def _has_pending_identity_control() -> bool:
+            return _read_identity_control() is not None
+
+        def _process_identity_control(cmd: dict[str, Any]) -> None:
+            action = str(cmd.get("action", "")).strip()
+            target_user_id = str(cmd.get("user_id", "")).strip()
+            replace = bool(cmd.get("replace", True))
+            result_payload = dict(cmd)
+            if not target_user_id:
+                result_payload["status"] = "error"
+                result_payload["message"] = "缺少 user_id"
+                _write_identity_control(result_payload)
+                return
+            display_name = memory.user_name(target_user_id)
+            try:
+                if action == "enroll_face":
+                    speak(
+                        reachy.media,
+                        f"请面对摄像头保持正脸，正在为{display_name}采集并更新人脸特征。",
+                        record_history=False,
+                    )
+                    captured_faces: list[tuple[Any, float]] = []
+                    for _ in range(5):
+                        sample_jpeg = capture_reachy_frame(
+                            reachy.media,
+                            timeout_seconds=3.0,
+                            persist=False,
+                            prefer_sharp=True,
+                            autofocus_settle_seconds=0.25,
+                        )
+                        observations = face_identifier.observe_all(sample_jpeg)
+                        if len(observations) == 1:
+                            captured_faces.append(
+                                (observations[0].embedding, observations[0].quality)
+                            )
+                        time.sleep(0.25)
+                    if not captured_faces:
+                        raise RuntimeError("画面里没有检测到单一清晰人脸，请单独面对摄像头再试")
+                    if replace:
+                        memory.clear_biometrics(target_user_id, "face")
+                    for emb, qual in captured_faces:
+                        memory.add_biometric(target_user_id, "face", emb, quality=qual)
+                    msg = f"已为{display_name}保存 {len(captured_faces)} 个人脸特征。"
+                    speak(reachy.media, msg, record_history=False)
+                    result_payload["status"] = "done"
+                    result_payload["message"] = msg
+                elif action == "enroll_voice":
+                    speak(
+                        reachy.media,
+                        f"请在提示后自然说几秒钟话，正在为{display_name}采集并更新声纹特征。",
+                        record_history=False,
+                    )
+                    _, captured_audio, captured_rate = speech.listen_once_with_audio(
+                        reachy.media, timeout_seconds=12.0
+                    )
+                    if not captured_audio.size:
+                        raise RuntimeError("没有录到足够清晰的语音")
+                    voice_emb = voice_identifier.embedding(captured_audio, captured_rate)
+                    if replace:
+                        memory.clear_biometrics(target_user_id, "voice")
+                    memory.add_biometric(target_user_id, "voice", voice_emb, quality=1.0)
+                    msg = f"已为{display_name}更新声纹特征。"
+                    speak(reachy.media, msg, record_history=False)
+                    result_payload["status"] = "done"
+                    result_payload["message"] = msg
+                else:
+                    result_payload["status"] = "error"
+                    result_payload["message"] = f"未知操作：{action}"
+            except Exception as exc:
+                result_payload["status"] = "error"
+                result_payload["message"] = str(exc)
+                speak(reachy.media, f"资料库特征更新失败：{exc}", record_history=False)
+            _write_identity_control(result_payload)
+
         while True:
+            pending_cmd = _read_identity_control()
+            if pending_cmd is not None:
+                _process_identity_control(pending_cmd)
+                continue
             pitch_capture = pitch_listen_pending
             pitch_listen_pending = False
             if pitch_capture:
@@ -1535,8 +2072,14 @@ def run_robot() -> None:
                 )
             else:
                 utterance, voice_audio, sample_rate = speech.listen_once_with_audio(
-                    reachy.media, timeout_seconds=12.0
+                    reachy.media,
+                    timeout_seconds=12.0,
+                    abort_check=_has_pending_identity_control,
                 )
+            pending_cmd = _read_identity_control()
+            if pending_cmd is not None:
+                _process_identity_control(pending_cmd)
+                continue
             pitch_analysis = None
             model_utterance = utterance
             if pitch_capture:
@@ -1594,6 +2137,65 @@ def run_robot() -> None:
             if not _is_meaningful_utterance(utterance):
                 print(f"Ignored ASR noise: {utterance!r}")
                 continue
+            precomputed_voice_match = None
+            if not pitch_capture:
+                extra_wake = tuple(
+                    w
+                    for w in (memory.get_setting("robot_name", ""),)
+                    if w
+                )
+                voice_user_for_gate = None
+                if (
+                    conversation_gate.current_mode == "family_voice_or_wake"
+                    and not conversation_gate.is_awake()
+                    and voice_audio.size
+                ):
+                    try:
+                        precomputed_voice_match = voice_identifier.identify(
+                            voice_audio, sample_rate
+                        )
+                        voice_user_for_gate = precomputed_voice_match.user_id
+                    except Exception:
+                        precomputed_voice_match = None
+                gate_decision = conversation_gate.evaluate(
+                    utterance,
+                    voice_user_id=voice_user_for_gate,
+                    extra_names=extra_wake,
+                )
+                if not gate_decision.accepted:
+                    print(f"Ignored standby/ambient speech: {utterance!r}")
+                    continue
+                if gate_decision.mode_changed == "wake_word":
+                    speak(
+                        reachy.media,
+                        "好的，已开启唤醒模式。平时我会安静待机，有事喊天线宝宝就行。",
+                        record_history=False,
+                    )
+                    continue
+                if gate_decision.mode_changed == "open":
+                    speak(
+                        reachy.media,
+                        "好的，已切换到自由对话模式，不用每次喊天线宝宝了。",
+                        record_history=False,
+                    )
+                    continue
+                if gate_decision.slept_now:
+                    speak(
+                        reachy.media,
+                        "好的，我先安静待机，有事再喊天线宝宝。",
+                        record_history=False,
+                    )
+                    continue
+                if gate_decision.wake_only:
+                    speak(
+                        reachy.media,
+                        "我在呢，你说。",
+                        record_history=False,
+                    )
+                    continue
+                if gate_decision.cleaned_text:
+                    utterance = gate_decision.cleaned_text
+                    model_utterance = utterance
             print(f"你：{utterance}")
             runtime_state.event("user", utterance)
             # Record immediately because many Agent-controlled branches answer
@@ -1712,6 +2314,7 @@ def run_robot() -> None:
             face_candidates: list[tuple[Any, Match]] = []
             visible_user_ids: list[str] = []
             visible_people: list[str] = []
+            visible_matches: list[Match] = []
             try:
                 frame = capture_reachy_frame(
                     reachy.media,
@@ -1765,20 +2368,32 @@ def run_robot() -> None:
                         f"candidate={face_match.candidate_user_id or 'none'}, "
                         f"score={face_match.confidence:.3f}"
                     )
-            except Exception:
+            except Exception as exc:
                 face_match = Match(None, 0.0, "face")
-            voice_match = voice_identifier.identify(voice_audio, sample_rate)
+                observation = None
+                face_observations = []
+                visible_matches = []
+                face_candidates = []
+                visible_user_ids = []
+                visible_people = []
+                print(f"Current face recognition unavailable: {exc}")
+            if precomputed_voice_match is not None:
+                voice_match = precomputed_voice_match
+            else:
+                try:
+                    voice_match = voice_identifier.identify(voice_audio, sample_rate)
+                except Exception as exc:
+                    voice_match = Match(None, 0.0, "voice")
+                    print(f"Current voice recognition unavailable: {exc}")
             print(
                 "Voice match: "
                 f"accepted={voice_match.user_id or 'none'}, "
                 f"candidate={voice_match.candidate_user_id or 'none'}, "
                 f"score={voice_match.confidence:.3f}"
             )
-            # Who is speaking is determined by voice only. A person visible in
-            # front of the camera may be a silent bystander while somebody else
-            # speaks from anywhere in the room. Face matches remain scene context.
-            raw_identity = speaker_identity_from_voice(voice_match)
-            identity = identity_stabilizer.update(raw_identity)
+            identity = resolve_speaker_identity(
+                voice_match, visible_matches, stabilizer=identity_stabilizer
+            )
             if identity.user_id:
                 brain.set_identity(
                     identity.user_id,
@@ -1843,8 +2458,10 @@ def run_robot() -> None:
             if VOICE_MATCH_RESULT_QUESTION.search(utterance):
                 if voice_match.user_id:
                     candidate_name = memory.user_name(voice_match.user_id)
-                    if identity.user_id == voice_match.user_id:
+                    if identity.reason == "voice-confirmed" and identity.user_id == voice_match.user_id:
                         status = "已经由本轮声纹确认"
+                    elif identity.reason == "face-fallback" and identity.user_id == voice_match.user_id:
+                        status = "声纹尚未确认，本轮已通过人脸特征回退识别"
                     else:
                         status = "目前只是候选，还没有达到换人条件"
                     message = (
@@ -1854,19 +2471,60 @@ def run_robot() -> None:
                 else:
                     message = (
                         f"本轮声纹最高相似度是{voice_match.confidence:.3f}，"
-                        "没有达到可靠匹配条件，所以没有指定说话者。"
+                        "没有达到可靠匹配条件。"
                     )
+                    if identity.reason == "face-fallback":
+                        message += f"不过我已根据人脸特征识别到你是{memory.user_name(identity.user_id)}。"
+                    else:
+                        message += "人脸回退也未能确定这轮说话者。"
                 print(message)
                 speak(reachy.media, message)
                 continue
 
             if CURRENT_IDENTITY_QUESTION.search(utterance):
                 if identity.user_id:
-                    message = f"这轮确认到的说话者是{memory.user_name(identity.user_id)}。"
+                    if identity.reason == "face-fallback":
+                        message = f"这轮声纹未确认，我根据人脸特征认出你是{memory.user_name(identity.user_id)}。"
+                    else:
+                        message = f"这轮确认到的说话者是{memory.user_name(identity.user_id)}。"
+                elif identity.reason == "face-multiple":
+                    message = "这轮声纹未确认，画面里又有多个人，我还不能确定是谁在说话。请再说一句，或单独面对摄像头。"
+                elif identity.reason == "face/voice conflict":
+                    message = "这轮声纹候选与人脸匹配到了不同的人，请再说一句或单独面对摄像头让我核对。"
                 else:
-                    message = "这轮声纹还不足以可靠确认你是谁；我会继续累计同一声纹，不猜名字。"
+                    message = "这轮声纹和当前人脸特征都还不足以认出你。请面对摄像头，再说一句稍长的话。"
                 print(message)
                 speak(reachy.media, message)
+                continue
+
+            if ENGLISH_TUTOR_OFF.search(utterance):
+                english_tutor_mode = False
+                active_english_target = None
+                speak(reachy.media, "好的，已退出英语纠音模式。")
+                continue
+
+            if ENGLISH_TUTOR_ON.search(utterance):
+                english_tutor_mode = True
+                pending_daily = (
+                    memory.get_daily_english(brain.user_id)
+                    if brain.user_id
+                    else None
+                )
+                active_english_target = (
+                    pending_daily.phrase
+                    if pending_daily and pending_daily.status != "completed"
+                    else None
+                )
+                if active_english_target:
+                    speak(
+                        reachy.media,
+                        f"已开启英语纠音模式。你可以直接跟我读：{active_english_target}，或者任意说英文，我会帮你听发音、重音和语气。",
+                    )
+                else:
+                    speak(
+                        reachy.media,
+                        "已开启英语纠音模式。你直接说英文句子或跟我自由对话，我会结合本地声学分析帮你听发音、语法和语调。",
+                    )
                 continue
 
             if DAILY_ENGLISH_REQUEST.search(utterance):
@@ -1897,14 +2555,15 @@ def run_robot() -> None:
             ):
                 if identity.user_id:
                     message = (
-                        "有权限。日常说话时我按声纹确认说话者，并自动维护这个身份的声纹模板。"
+                        "有权限。日常说话时优先按声纹确认身份，未确认时尝试用当前唯一匹配的人脸识别。"
+                        "只有可靠确认声纹后，才自动维护声纹模板。"
                         "人脸不会因为谁坐在镜头中央就自动绑定；你要录入自己的脸时，"
                         "面对摄像头说“记住我的脸”即可。"
                     )
                 else:
                     message = (
                         "有权限。姓名、声纹和人脸都能挂在同一个身份编号下面。"
-                        "但当前这句话的声纹还没有可靠确认，所以我不会往任何人的档案里写特征。"
+                        "但这一轮的声纹和人脸还没有确定身份，所以我不会往任何人的档案里写特征。"
                     )
                 print(message)
                 speak(reachy.media, message)
@@ -1925,15 +2584,42 @@ def run_robot() -> None:
                         if user_id == linked_user_id
                     )
                     message = (
-                        f"当前声纹确认到的是{linked_name}。这个身份编号下面有"
+                        f"当前通过{'人脸回退' if identity.reason == 'face-fallback' else '声纹'}识别到的是{linked_name}。这个身份编号下面有"
                         f"{face_count}组人脸特征和{voice_count}组声纹特征，姓名也保存在同一条用户记录里。"
-                        "声纹判断谁在说话，人脸只判断我看见了谁。"
+                        "优先用声纹判断，未确认时再尝试当前唯一可靠匹配的人脸。"
                     )
                 else:
                     message = (
                         "特征库会把姓名、声纹和人脸挂在同一个身份编号下面。"
-                        "这一轮声纹还没有可靠确认说话者，所以我只把画面中的脸当作可见人物，不拿它猜谁在说话。"
+                        "这一轮声纹和人脸回退都未能确定说话者；多人同框时不会仅凭谁坐在中间猜身份。"
                     )
+                print(message)
+                speak(reachy.media, message)
+                continue
+
+            if VOICE_ENROLL_REQUEST.search(utterance):
+                if not identity.user_id:
+                    message = "我还没有确认你是谁，请先正常说一句稍长的话或面对摄像头，再更新声纹。"
+                    print(message)
+                    speak(reachy.media, message)
+                    continue
+                replace_voice = bool(re.search(r"重新|重录|替换|覆盖", utterance))
+                try:
+                    voice_emb = voice_identifier.embedding(voice_audio, sample_rate)
+                except ValueError:
+                    speak(reachy.media, "刚才这句太短了，请在提示后自然说五秒钟话来更新声纹。")
+                    _, v_audio, v_rate = speech.listen_once_with_audio(
+                        reachy.media, timeout_seconds=12.0
+                    )
+                    try:
+                        voice_emb = voice_identifier.embedding(v_audio, v_rate)
+                    except ValueError:
+                        speak(reachy.media, "这次还是没有采集到足够长的语音，请靠近一些再试。")
+                        continue
+                if replace_voice:
+                    memory.clear_biometrics(identity.user_id, "voice")
+                memory.add_biometric(identity.user_id, "voice", voice_emb, quality=1.0)
+                message = f"好的，我已经为{memory.user_name(identity.user_id)}更新了声纹特征。"
                 print(message)
                 speak(reachy.media, message)
                 continue
@@ -1969,6 +2655,9 @@ def run_robot() -> None:
                     print(message)
                     speak(reachy.media, message)
                     continue
+                replace_face = bool(re.search(r"重新|重录|替换|覆盖", utterance))
+                if replace_face:
+                    memory.clear_biometrics(identity.user_id, "face")
                 memory.add_biometric(
                     identity.user_id,
                     "face",
@@ -1977,7 +2666,7 @@ def run_robot() -> None:
                 )
                 message = (
                     f"好了，我已经把这张脸绑定到{memory.user_name(identity.user_id)}的身份档案。"
-                    "以后声纹负责判断谁在说话，人脸只负责判断我看见了谁。"
+                    "以后优先用声纹认你，声纹未确认时会尝试用当前唯一可靠匹配的人脸。"
                 )
                 print(message)
                 speak(reachy.media, message)
@@ -2080,6 +2769,14 @@ def run_robot() -> None:
                     identity.user_id if identity.reason == "voice-confirmed" else None
                 )
                 if (
+                    identity.reason == "face-fallback"
+                    and memory.user_name(identity.user_id) == introduced_name
+                ):
+                    # Explicit self-introduction agrees with the freshly
+                    # recognized face: attach this voice to the same profile,
+                    # rather than creating a duplicate person.
+                    confirmed_identity = identity.user_id
+                if (
                     confirmed_identity is None
                     and voice_match.user_id
                     and voice_match.confidence >= 0.50
@@ -2089,10 +2786,13 @@ def run_robot() -> None:
                 user_id = confirmed_identity or conversational_user_id(
                     memory, introduced_name, voice_embedding.tobytes()
                 )
-                memory.ensure_user(user_id, introduced_name)
-                memory.remember_official_fact(
-                    user_id, f"The user prefers to be called {introduced_name}."
-                )
+                if confirmed_identity:
+                    memory.rename_user(confirmed_identity, introduced_name)
+                else:
+                    memory.ensure_user(user_id, introduced_name)
+                    memory.remember_official_fact(
+                        user_id, f"The user prefers to be called {introduced_name}."
+                    )
                 memory.add_biometric(user_id, "voice", voice_embedding, quality=1.0)
                 default_profile(user_id)
                 memory.add_episode(
@@ -2117,6 +2817,44 @@ def run_robot() -> None:
                 and memory.get_daily_english(brain.user_id)
             ):
                 memory.complete_daily_english(brain.user_id, utterance)
+                active_english_target = None
+
+            if not pitch_capture:
+                speech_analysis = getattr(speech, "last_speech_analysis", None)
+                english_words = extract_english_words(utterance)
+                pron_requested = bool(ENGLISH_PRONUNCIATION_REQUEST.search(utterance))
+                pending_daily = (
+                    memory.get_daily_english(brain.user_id)
+                    if brain.user_id
+                    else None
+                )
+                pending_phrase = (
+                    pending_daily.phrase
+                    if pending_daily and pending_daily.status != "completed"
+                    else None
+                )
+                should_assess_english = bool(english_words) and (
+                    english_tutor_mode or pron_requested or pending_phrase is not None
+                )
+                if should_assess_english and voice_audio.size:
+                    target_phrase = active_english_target or pending_phrase
+                    pron_result = english_assessor.assess(
+                        voice_audio,
+                        sample_rate,
+                        heard_text=utterance,
+                        target_text=target_phrase,
+                        speech_analysis=speech_analysis,
+                    )
+                    last_pronunciation_result = pron_result
+                    print(f"English pronunciation: {pron_result.display_summary()}")
+                    model_utterance = f"{utterance}\n\n{pron_result.model_context()}"
+                elif pron_requested and last_pronunciation_result is not None:
+                    model_utterance = (
+                        f"{utterance}\n\n"
+                        f"{last_pronunciation_result.model_context()}"
+                    )
+                elif speech_analysis is not None and speech_analysis.has_notable_prosody:
+                    model_utterance = f"{utterance}\n\n{speech_analysis.model_context()}"
 
             recent_frames: list[bytes] = []
             if requires_vision(utterance):
@@ -2162,6 +2900,51 @@ def run_robot() -> None:
                     speak(reachy.media, "模型暂时没有响应，请稍后再试。")
                 continue
             active_model = str(route.get("model_id") or route.get("route", "unknown"))
+            clear_biometrics = route.get("clear_biometrics", [])
+            update_biometrics = route.get("update_biometrics", [])
+            deferred_voice_capture = False
+            deferred_face_capture = False
+            deferred_face_replace = False
+            if clear_biometrics or update_biometrics:
+                if not brain._is_confirmed_identity() or not identity.user_id:
+                    reply = "为了防止认错人，先让我通过声纹或正脸确认你的身份，再帮你更新特征档案。"
+                else:
+                    for modality in clear_biometrics:
+                        memory.clear_biometrics(identity.user_id, modality)
+                        print(f"Cleared {modality} biometrics for {identity.user_id}")
+                    for modality, replace in update_biometrics:
+                        if modality == "voice":
+                            try:
+                                v_emb = voice_identifier.embedding(voice_audio, sample_rate)
+                                if replace:
+                                    memory.clear_biometrics(identity.user_id, "voice")
+                                memory.add_biometric(identity.user_id, "voice", v_emb, quality=1.0)
+                                print(f"Updated voice biometric for {identity.user_id} (replace={replace})")
+                            except ValueError:
+                                deferred_voice_capture = True
+                                deferred_voice_replace = replace
+                        elif modality == "face":
+                            linked = [
+                                item for item in face_candidates if item[1].user_id == identity.user_id
+                            ]
+                            chosen_face = None
+                            if linked:
+                                chosen_face, _ = min(linked, key=lambda item: item[0].center_distance)
+                            elif len(face_observations) == 1:
+                                chosen_face = face_observations[0]
+                            if chosen_face is not None:
+                                if replace:
+                                    memory.clear_biometrics(identity.user_id, "face")
+                                memory.add_biometric(
+                                    identity.user_id,
+                                    "face",
+                                    chosen_face.embedding,
+                                    quality=chosen_face.quality,
+                                )
+                                print(f"Updated face biometric for {identity.user_id} (replace={replace})")
+                            else:
+                                deferred_face_capture = True
+                                deferred_face_replace = replace
             print(f"Reachy[{active_model}]：{reply}")
             actions = route.get("actions", [])
             if actions:
@@ -2248,6 +3031,7 @@ def run_robot() -> None:
                         _clean_for_speech(reply),
                         route=active_model,
                         record_history=False,
+                        display_text=reply,
                     )
                     song_path = singing.render(
                         str(singing_lyrics),
@@ -2265,7 +3049,65 @@ def run_robot() -> None:
                     _clean_for_speech(reply),
                     route=active_model,
                     record_history=False,
+                    display_text=reply,
                 )
+            if identity.user_id and deferred_voice_capture:
+                speak(
+                    reachy.media,
+                    "刚才那句语音太短了，请在提示后自然说五秒钟话，我来为你采集声纹。",
+                    record_history=False,
+                )
+                _, cap_audio, cap_rate = speech.listen_once_with_audio(
+                    reachy.media, timeout_seconds=12.0
+                )
+                try:
+                    v_emb = voice_identifier.embedding(cap_audio, cap_rate)
+                    if deferred_voice_replace:
+                        memory.clear_biometrics(identity.user_id, "voice")
+                    memory.add_biometric(identity.user_id, "voice", v_emb, quality=1.0)
+                    speak(
+                        reachy.media,
+                        f"好的，已为{memory.user_name(identity.user_id)}更新声纹特征。",
+                        record_history=False,
+                    )
+                except ValueError:
+                    speak(reachy.media, "这次还是没有采集到足够长的语音，稍后再试。")
+            if identity.user_id and deferred_face_capture:
+                speak(
+                    reachy.media,
+                    "现在镜头里没有单一正脸，请单独面对摄像头，我来采集人脸特征。",
+                    record_history=False,
+                )
+                captured_faces: list[tuple[Any, float]] = []
+                for _ in range(4):
+                    try:
+                        cap_jpeg = capture_reachy_frame(
+                            reachy.media,
+                            timeout_seconds=2.5,
+                            persist=False,
+                            prefer_sharp=True,
+                            autofocus_settle_seconds=0.2,
+                        )
+                        obs = face_identifier.observe_all(cap_jpeg)
+                        if len(obs) == 1:
+                            captured_faces.append((obs[0].embedding, obs[0].quality))
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
+                if captured_faces:
+                    if deferred_face_replace:
+                        memory.clear_biometrics(identity.user_id, "face")
+                    for f_emb, f_qual in captured_faces:
+                        memory.add_biometric(identity.user_id, "face", f_emb, quality=f_qual)
+                    speak(
+                        reachy.media,
+                        f"已为{memory.user_name(identity.user_id)}更新了 {len(captured_faces)} 个人脸特征。",
+                        record_history=False,
+                    )
+                else:
+                    speak(reachy.media, "还是没有检测到单独的清晰人脸，请正对摄像头再试一次。", record_history=False)
+            if conversation_gate.is_awake():
+                conversation_gate.wake()
     memory.close()
 
 

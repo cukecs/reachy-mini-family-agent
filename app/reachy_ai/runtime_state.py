@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +38,7 @@ class RuntimeState:
             "messages": previous_messages,
             "updated_at": self._now(),
         }
+        self._pending_events: dict[str, tuple[str, dict[str, Any]]] = {}
         self._write()
 
     @staticmethod
@@ -48,12 +51,59 @@ class RuntimeState:
         temporary.write_text(
             json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        os.replace(temporary, self.path)
+        for attempt in range(5):
+            try:
+                os.replace(temporary, self.path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.01)
 
     def status(self, value: str, detail: str = "") -> None:
         with self._lock:
             self._data["status"] = value
             self._data["detail"] = detail
+            self._data["updated_at"] = self._now()
+            self._write()
+
+    def begin_event(self, role: str, **metadata: Any) -> str:
+        """Reserve an event ID without rendering an empty bubble before audio starts."""
+        event_id = uuid.uuid4().hex[:12]
+        clean_meta = {k: v for k, v in metadata.items() if v is not None}
+        with self._lock:
+            self._pending_events[event_id] = (role, clean_meta)
+        return event_id
+
+    def update_event(self, event_id: str, text: str, **metadata: Any) -> None:
+        """Create or progressively update a synced transcript message in place."""
+        cleaned = str(text).strip()
+        if not cleaned:
+            return
+        with self._lock:
+            for item in reversed(self._data["messages"]):
+                if item.get("id") == event_id:
+                    if item.get("text") == cleaned:
+                        return
+                    item["text"] = cleaned
+                    for key, value in metadata.items():
+                        if value is not None:
+                            item[key] = value
+                    self._data["updated_at"] = self._now()
+                    self._write()
+                    return
+
+            role, base_meta = self._pending_events.pop(event_id, ("assistant", {}))
+            message: dict[str, Any] = {
+                "id": event_id,
+                "role": role,
+                "text": cleaned,
+                "time": self._now(),
+            }
+            message.update(base_meta)
+            message.update({k: v for k, v in metadata.items() if v is not None})
+            self._data["messages"].append(message)
+            self._data["messages"] = self._data["messages"][-self.max_messages :]
             self._data["updated_at"] = self._now()
             self._write()
 

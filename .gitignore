@@ -23,6 +23,7 @@ __pycache__/
 /config/*
 !/config/settings.example.json
 !/config/local-model.example.json
+!/config/tts-pronunciation.example.json
 /scripts/repair-identity-memory.py
 *.sqlite
 *.sqlite3

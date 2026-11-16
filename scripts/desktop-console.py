@@ -27,6 +27,8 @@ LOCAL_MODEL_PATH = ROOT / "config" / "local-model.json"
 STATE_PATH = ROOT / "data" / "runtime-state.json"
 CAMERA_PATH = ROOT / "data" / "live-camera.jpg"
 SPEECH_CONTROL_PATH = ROOT / "data" / "speech-control.json"
+IDENTITY_CONTROL_PATH = ROOT / "data" / "identity-control.json"
+VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
 SCRIPTS = ROOT / "scripts"
 DEFAULT_SCORE_ROOT = ROOT / "data" / "scores"
 _control_mutex_handle = None
@@ -173,7 +175,8 @@ class ReachyConsole(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self._events: queue.Queue[tuple[str, str]] = queue.Queue()
         self._camera_mtime = 0.0
-        self._state_mtime = 0.0
+        self._state_sig: tuple[int, int] = (0, 0)
+        self._rendered_transcript = ""
         self._photo: ImageTk.PhotoImage | None = None
         self._settings_vars: dict[str, tk.StringVar] = {}
         self._runtime_vars: dict[str, tk.StringVar] = {}
@@ -186,12 +189,23 @@ class ReachyConsole(tk.Tk):
         self._network_vars: dict[str, tk.StringVar] = {}
         self._singing_vars: dict[str, tk.StringVar] = {}
         self._speech_filter_vars: dict[str, tk.StringVar] = {}
+        self._gate_vars: dict[str, tk.StringVar] = {}
+        self._selected_profile_id: str | None = None
+        self._profile_name_var = tk.StringVar()
+        self._profile_id_var = tk.StringVar()
+        self._profile_replace_var = tk.BooleanVar(value=True)
+        self._profile_bio_summary_var = tk.StringVar(value="请选择左侧成员")
+        self._profile_status_var = tk.StringVar(value="就绪")
+        self._fact_key_var = tk.StringVar()
+        self._fact_value_var = tk.StringVar()
+        self._fact_visibility_var = tk.StringVar(value="private")
         self._launch_start_requested = False
         self._configure_style()
         self._build_ui()
         self._load_settings()
+        self._refresh_profiles()
         self.after(120, self._poll_camera)
-        self.after(250, self._poll_runtime_state)
+        self.after(80, self._poll_runtime_state)
         self.after(200, self._drain_events)
         self.after(300, self._refresh_status_async)
         self.after(800, self._start_backends_on_launch)
@@ -315,12 +329,15 @@ class ReachyConsole(tk.Tk):
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True, padx=18, pady=(0, 18))
         live_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
+        profiles_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
         settings_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
         logs_tab = ttk.Frame(notebook, style="Panel.TFrame", padding=12)
         notebook.add(live_tab, text="实时画面与字幕")
+        notebook.add(profiles_tab, text="家庭成员与资料库")
         notebook.add(settings_tab, text="模型与 API 配置")
         notebook.add(logs_tab, text="运行日志")
         self._build_live_tab(live_tab)
+        self._build_profiles_tab(profiles_tab)
         self._build_settings_tab(settings_tab)
         self._build_logs_tab(logs_tab)
 
@@ -545,13 +562,14 @@ class ReachyConsole(tk.Tk):
             style="Muted.TLabel",
         ).pack(side="left", padx=12)
 
-        speech_filter = ttk.LabelFrame(body, text="麦克风人声过滤", padding=12)
+        speech_filter = ttk.LabelFrame(body, text="麦克风人声过滤与唤醒防误触", padding=12)
         speech_filter.grid(row=5, column=0, columnspan=3, sticky="ew", padx=6, pady=8)
         filter_fields = [
             ("enabled", "启用过滤"),
             ("threshold", "人声阈值（高=更严格）"),
             ("min_speech_seconds", "最短累计人声（秒）"),
             ("min_contiguous_seconds", "最短连续人声（秒）"),
+            ("min_rms", "最小音量门限（防远场视频声）"),
         ]
         for column, (field, label) in enumerate(filter_fields):
             cell = ttk.Frame(speech_filter, style="Panel.TFrame")
@@ -560,6 +578,19 @@ class ReachyConsole(tk.Tk):
             ttk.Label(cell, text=label, style="Muted.TLabel").pack(anchor="w")
             variable = tk.StringVar()
             self._speech_filter_vars[field] = variable
+            ttk.Entry(cell, textvariable=variable).pack(fill="x")
+
+        gate_fields = [
+            ("mode", "门控模式（wake_word / family_voice_or_wake / open）"),
+            ("wake_words", "唤醒词（逗号分隔）"),
+            ("active_window_seconds", "唤醒后连续对话窗口（秒）"),
+        ]
+        for column, (field, label) in enumerate(gate_fields):
+            cell = ttk.Frame(speech_filter, style="Panel.TFrame")
+            cell.grid(row=1, column=column, sticky="ew", padx=6, pady=5)
+            ttk.Label(cell, text=label, style="Muted.TLabel").pack(anchor="w")
+            variable = tk.StringVar()
+            self._gate_vars[field] = variable
             ttk.Entry(cell, textvariable=variable).pack(fill="x")
 
         controls = ttk.Frame(body, style="Panel.TFrame", padding=(6, 10))
@@ -589,6 +620,108 @@ class ReachyConsole(tk.Tk):
             font=("Cascadia Mono", 10),
         )
         self.logs.pack(fill="both", expand=True)
+
+    def _build_profiles_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=2)
+        parent.columnconfigure(1, weight=3)
+        parent.rowconfigure(0, weight=1)
+
+        left = ttk.LabelFrame(parent, text="家庭成员列表", padding=10)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+
+        self.profile_tree = ttk.Treeview(
+            left,
+            columns=("name", "face", "voice", "facts"),
+            show="headings",
+            height=12,
+        )
+        self.profile_tree.heading("name", text="姓名")
+        self.profile_tree.heading("face", text="人脸")
+        self.profile_tree.heading("voice", text="声纹")
+        self.profile_tree.heading("facts", text="记忆")
+        self.profile_tree.column("name", width=130)
+        self.profile_tree.column("face", width=55, anchor="center")
+        self.profile_tree.column("voice", width=55, anchor="center")
+        self.profile_tree.column("facts", width=55, anchor="center")
+        self.profile_tree.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        self.profile_tree.bind("<<TreeviewSelect>>", self._on_profile_select)
+
+        left_actions = ttk.Frame(left, style="Panel.TFrame", padding=(0, 8))
+        left_actions.grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Button(left_actions, text="刷新列表", command=self._refresh_profiles).pack(side="left", padx=(0, 6))
+        ttk.Button(left_actions, text="新增成员", command=self._create_profile).pack(side="left", padx=(0, 6))
+        ttk.Button(left_actions, text="删除成员", command=self._delete_profile).pack(side="left")
+
+        right = ttk.Frame(parent, style="Panel.TFrame")
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
+
+        identity_box = ttk.LabelFrame(right, text="基本信息与改名", padding=10)
+        identity_box.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        identity_box.columnconfigure(1, weight=1)
+        ttk.Label(identity_box, text="成员 ID", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(identity_box, textvariable=self._profile_id_var, state="readonly").grid(row=0, column=1, sticky="ew", pady=2)
+        ttk.Label(identity_box, text="显示姓名", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(identity_box, textvariable=self._profile_name_var).grid(row=1, column=1, sticky="ew", pady=2)
+        ttk.Button(identity_box, text="保存改名", style="Accent.TButton", command=self._rename_profile).grid(row=1, column=2, padx=(8, 0))
+
+        bio_box = ttk.LabelFrame(right, text="人脸与声纹特征更新", padding=10)
+        bio_box.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(bio_box, textvariable=self._profile_bio_summary_var).pack(anchor="w")
+        ttk.Checkbutton(
+            bio_box,
+            text="重新采集时覆盖该成员原有特征（推荐）",
+            variable=self._profile_replace_var,
+        ).pack(anchor="w", pady=(4, 6))
+        bio_btns = ttk.Frame(bio_box, style="Panel.TFrame")
+        bio_btns.pack(fill="x")
+        ttk.Button(bio_btns, text="采集并更新人脸", style="Accent.TButton", command=lambda: self._capture_biometric("face")).pack(side="left", padx=(0, 6))
+        ttk.Button(bio_btns, text="采集并更新声纹", style="Accent.TButton", command=lambda: self._capture_biometric("voice")).pack(side="left", padx=(0, 6))
+        ttk.Button(bio_btns, text="清空人脸", command=lambda: self._clear_biometrics("face")).pack(side="left", padx=(0, 6))
+        ttk.Button(bio_btns, text="清空声纹", command=lambda: self._clear_biometrics("voice")).pack(side="left")
+        ttk.Label(bio_box, textvariable=self._profile_status_var, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+
+        facts_box = ttk.LabelFrame(right, text="个人记忆条目（Facts）", padding=10)
+        facts_box.grid(row=2, column=0, sticky="nsew")
+        facts_box.columnconfigure(1, weight=1)
+        facts_box.rowconfigure(0, weight=1)
+
+        self.facts_tree = ttk.Treeview(
+            facts_box,
+            columns=("key", "value", "visibility"),
+            show="headings",
+            height=8,
+        )
+        self.facts_tree.heading("key", text="键名 (key)")
+        self.facts_tree.heading("value", text="内容 (value)")
+        self.facts_tree.heading("visibility", text="可见性")
+        self.facts_tree.column("key", width=150)
+        self.facts_tree.column("value", width=260)
+        self.facts_tree.column("visibility", width=70, anchor="center")
+        self.facts_tree.grid(row=0, column=0, columnspan=4, sticky="nsew", pady=(0, 8))
+        self.facts_tree.bind("<<TreeviewSelect>>", self._on_fact_select)
+
+        ttk.Label(facts_box, text="键名", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        ttk.Entry(facts_box, textvariable=self._fact_key_var, width=18).grid(row=1, column=1, sticky="ew", padx=(0, 8))
+        ttk.Label(facts_box, text="可见性", style="Muted.TLabel").grid(row=1, column=2, sticky="w", padx=(0, 6))
+        ttk.Combobox(
+            facts_box,
+            textvariable=self._fact_visibility_var,
+            values=("private", "public"),
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=3, sticky="w")
+
+        ttk.Label(facts_box, text="内容", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        ttk.Entry(facts_box, textvariable=self._fact_value_var).grid(row=2, column=1, columnspan=3, sticky="ew", pady=(6, 0))
+
+        fact_btns = ttk.Frame(facts_box, style="Panel.TFrame", padding=(0, 8))
+        fact_btns.grid(row=3, column=0, columnspan=4, sticky="ew")
+        ttk.Button(fact_btns, text="新增 / 更新记忆", command=self._upsert_fact).pack(side="left", padx=(0, 6))
+        ttk.Button(fact_btns, text="删除选中记忆", command=self._delete_fact).pack(side="left")
 
     def _browse_file(self, field: str) -> None:
         initial = Path(self._runtime_vars[field].get() or ROOT)
@@ -880,10 +1013,24 @@ class ReachyConsole(tk.Tk):
                 "threshold": 0.58,
                 "min_speech_seconds": 0.20,
                 "min_contiguous_seconds": 0.128,
+                "min_rms": 0.004,
             }
             for field, variable in self._speech_filter_vars.items():
                 value = speech_filter.get(field, filter_defaults[field])
                 variable.set(str(value).lower() if isinstance(value, bool) else str(value))
+
+            gate = settings.get("conversation_gate", {})
+            gate_defaults = {
+                "mode": "wake_word",
+                "wake_words": ["天线宝宝", "Reachy"],
+                "active_window_seconds": 45,
+            }
+            for field, variable in self._gate_vars.items():
+                value = gate.get(field, gate_defaults[field])
+                if isinstance(value, list):
+                    variable.set(", ".join(str(item) for item in value))
+                else:
+                    variable.set(str(value))
             self._log("已载入模型和 API 配置。")
         except Exception as exc:
             messagebox.showerror("配置读取失败", str(exc))
@@ -987,6 +1134,27 @@ class ReachyConsole(tk.Tk):
             speech_filter["min_contiguous_seconds"] = self._convert_number(
                 self._speech_filter_vars["min_contiguous_seconds"].get(), float, "最短连续人声"
             )
+            speech_filter["min_rms"] = self._convert_number(
+                self._speech_filter_vars["min_rms"].get(), float, "最小音量门限"
+            )
+
+            gate_mode = self._gate_vars["mode"].get().strip().lower()
+            if gate_mode not in {"wake_word", "family_voice_or_wake", "open"}:
+                raise ValueError("门控模式必须填写 wake_word、family_voice_or_wake 或 open")
+            wake_words = [
+                part.strip()
+                for part in self._gate_vars["wake_words"].get().replace("，", ",").split(",")
+                if part.strip()
+            ]
+            if not wake_words:
+                raise ValueError("至少填写一个唤醒词")
+            gate = settings.setdefault("conversation_gate", {})
+            gate["enabled"] = gate_mode != "open"
+            gate["mode"] = gate_mode
+            gate["wake_words"] = wake_words
+            gate["active_window_seconds"] = self._convert_number(
+                self._gate_vars["active_window_seconds"].get(), float, "连续对话窗口"
+            )
 
             for field in ("server_path", "model_path", "mmproj_path", "alias", "host", "cache_type_k", "cache_type_v"):
                 runtime[field] = self._runtime_vars[field].get().strip()
@@ -1087,6 +1255,10 @@ class ReachyConsole(tk.Tk):
                     self._refresh_status_async(schedule_next=False)
                 elif kind == "status":
                     self._apply_status(text)
+                elif kind == "profile_status":
+                    self._profile_status_var.set(text)
+                elif kind == "profiles_refresh":
+                    self._refresh_profiles()
         except queue.Empty:
             pass
         self.after(200, self._drain_events)
@@ -1109,24 +1281,29 @@ class ReachyConsole(tk.Tk):
 
     def _poll_runtime_state(self) -> None:
         try:
-            mtime = STATE_PATH.stat().st_mtime
-            if mtime != self._state_mtime:
-                self._state_mtime = mtime
+            stat = STATE_PATH.stat()
+            sig = (stat.st_mtime_ns, stat.st_size)
+            if sig != self._state_sig:
                 state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-                self.transcript.configure(state="normal")
-                self.transcript.delete("1.0", "end")
-                for message in state.get("messages", []):
-                    role = message.get("role", "assistant")
-                    who = "你" if role == "user" else "Reachy"
-                    route = message.get("route")
-                    meta = f" · {route}" if route else ""
-                    self.transcript.insert("end", f"{who}{meta}  {message.get('time', '')}\n", "meta")
-                    self.transcript.insert("end", message.get("text", "") + "\n", role)
-                self.transcript.see("end")
-                self.transcript.configure(state="disabled")
+                self._state_sig = sig
+                messages = state.get("messages", [])
+                rendered = json.dumps(messages, ensure_ascii=False)
+                if rendered != self._rendered_transcript:
+                    self._rendered_transcript = rendered
+                    self.transcript.configure(state="normal")
+                    self.transcript.delete("1.0", "end")
+                    for message in messages:
+                        role = message.get("role", "assistant")
+                        who = "你" if role == "user" else "Reachy"
+                        route = message.get("route")
+                        meta = f" · {route}" if route else ""
+                        self.transcript.insert("end", f"{who}{meta}  {message.get('time', '')}\n", "meta")
+                        self.transcript.insert("end", message.get("text", "") + "\n", role)
+                    self.transcript.see("end")
+                    self.transcript.configure(state="disabled")
         except (FileNotFoundError, OSError, json.JSONDecodeError):
             pass
-        self.after(250, self._poll_runtime_state)
+        self.after(80, self._poll_runtime_state)
 
     @staticmethod
     def _url_json(url: str, timeout: float = 1.5) -> dict | None:
@@ -1162,6 +1339,293 @@ class ReachyConsole(tk.Tk):
         self.robot_status.set(robot_text)
         self.ai_status.set(ai_text)
         self.summary_var.set("摄像头实时共享中" if camera_live else "等待机器人摄像头")
+
+    @staticmethod
+    def _run_memory_admin(*args: str) -> str:
+        python_exe = VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable)
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        completed = subprocess.run(
+            [str(python_exe), str(SCRIPTS / "memory-admin.py"), *args],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+            timeout=20,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stderr.strip() or completed.stdout.strip() or "资料库命令执行失败")
+        return completed.stdout
+
+    def _refresh_profiles(self) -> None:
+        try:
+            raw = self._run_memory_admin("list")
+            profiles = json.loads(raw or "[]")
+        except Exception as exc:
+            self._profile_status_var.set(f"读取失败：{exc}")
+            return
+        selected = self._selected_profile_id
+        for item in self.profile_tree.get_children():
+            self.profile_tree.delete(item)
+        for profile in profiles:
+            uid = str(profile["user_id"])
+            self.profile_tree.insert(
+                "",
+                "end",
+                iid=uid,
+                values=(
+                    profile.get("display_name", uid),
+                    profile.get("face_count", 0),
+                    profile.get("voice_count", 0),
+                    profile.get("fact_count", 0),
+                ),
+            )
+        if selected and self.profile_tree.exists(selected):
+            self.profile_tree.selection_set(selected)
+            self._load_profile_details(selected)
+        elif profiles:
+            first_id = str(profiles[0]["user_id"])
+            self.profile_tree.selection_set(first_id)
+            self._load_profile_details(first_id)
+        else:
+            self._selected_profile_id = None
+            self._profile_id_var.set("")
+            self._profile_name_var.set("")
+            self._profile_bio_summary_var.set("暂无家庭成员记录")
+            for item in self.facts_tree.get_children():
+                self.facts_tree.delete(item)
+
+    def _on_profile_select(self, _event=None) -> None:
+        selection = self.profile_tree.selection()
+        if not selection:
+            return
+        self._load_profile_details(str(selection[0]))
+
+    def _load_profile_details(self, user_id: str) -> None:
+        self._selected_profile_id = user_id
+        try:
+            data = json.loads(self._run_memory_admin("show", "--user", user_id))
+        except Exception as exc:
+            self._profile_status_var.set(f"读取详情失败：{exc}")
+            return
+        self._profile_id_var.set(user_id)
+        self._profile_name_var.set(str(data.get("name", user_id)))
+        self._profile_bio_summary_var.set(
+            f"当前特征：人脸 {data.get('face_templates', 0)} 条 · 声纹 {data.get('voice_templates', 0)} 条"
+        )
+        for item in self.facts_tree.get_children():
+            self.facts_tree.delete(item)
+        for fact in data.get("facts", []):
+            self.facts_tree.insert(
+                "",
+                "end",
+                values=(fact.get("key", ""), fact.get("value", ""), fact.get("visibility", "private")),
+            )
+
+    def _create_profile(self) -> None:
+        name = simpledialog.askstring("新增成员", "请输入成员姓名：", parent=self)
+        if not name or not name.strip():
+            return
+        clean_name = name.strip()
+        user_id = re.sub(r"[^a-z0-9_]+", "_", clean_name.lower()).strip("_")
+        if not user_id:
+            user_id = f"person_{int(time.time())}"
+        try:
+            self._run_memory_admin("create-user", "--user", user_id, "--name", clean_name)
+            self._run_memory_admin("set-fact", "--user", user_id, "--key", "preferred_name", "--value", clean_name, "--public")
+            self._selected_profile_id = user_id
+            self._refresh_profiles()
+            self._profile_status_var.set(f"已创建成员：{clean_name} ({user_id})")
+        except Exception as exc:
+            messagebox.showerror("新增失败", str(exc))
+
+    def _rename_profile(self) -> None:
+        user_id = self._selected_profile_id
+        if not user_id:
+            messagebox.showinfo("提示", "请先在左侧选择一名成员。")
+            return
+        new_name = self._profile_name_var.get().strip()
+        if not new_name:
+            messagebox.showerror("改名失败", "姓名不能为空。")
+            return
+        try:
+            self._run_memory_admin("rename-user", "--user", user_id, "--name", new_name)
+            self._refresh_profiles()
+            self._profile_status_var.set(f"已改名为：{new_name}")
+            self._log(f"资料库：成员 {user_id} 已改名为 {new_name}")
+        except Exception as exc:
+            messagebox.showerror("改名失败", str(exc))
+
+    def _delete_profile(self) -> None:
+        user_id = self._selected_profile_id
+        if not user_id:
+            return
+        name = self._profile_name_var.get().strip() or user_id
+        if not messagebox.askyesno("确认删除", f"确定删除成员“{name}”及其所有人脸/声纹/记忆吗？"):
+            return
+        try:
+            self._run_memory_admin("delete-user", "--user", user_id)
+            self._selected_profile_id = None
+            self._refresh_profiles()
+            self._profile_status_var.set(f"已删除成员：{name}")
+            self._log(f"资料库：已删除成员 {name} ({user_id})")
+        except Exception as exc:
+            messagebox.showerror("删除失败", str(exc))
+
+    def _clear_biometrics(self, modality: str) -> None:
+        user_id = self._selected_profile_id
+        if not user_id:
+            messagebox.showinfo("提示", "请先在左侧选择一名成员。")
+            return
+        label = "人脸" if modality == "face" else "声纹"
+        if not messagebox.askyesno("确认清空", f"确定清空该成员的所有{label}特征吗？"):
+            return
+        try:
+            output = self._run_memory_admin("clear-biometrics", "--user", user_id, "--modality", modality)
+            self._refresh_profiles()
+            self._profile_status_var.set(f"已清空{label}特征")
+            self._log(output.strip())
+        except Exception as exc:
+            messagebox.showerror("清空失败", str(exc))
+
+    def _capture_biometric(self, modality: str) -> None:
+        user_id = self._selected_profile_id
+        if not user_id:
+            messagebox.showinfo("提示", "请先在左侧选择一名成员。")
+            return
+        name = self._profile_name_var.get().strip() or user_id
+        replace = bool(self._profile_replace_var.get())
+        label = "人脸" if modality == "face" else "声纹"
+        agent_live = False
+        try:
+            agent_live = time.time() - CAMERA_PATH.stat().st_mtime < 3.0
+        except OSError:
+            pass
+
+        if agent_live:
+            cmd_id = f"{int(time.time() * 1000)}"
+            payload = {
+                "id": cmd_id,
+                "action": f"enroll_{modality}",
+                "user_id": user_id,
+                "replace": replace,
+                "status": "pending",
+            }
+            IDENTITY_CONTROL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = IDENTITY_CONTROL_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(IDENTITY_CONTROL_PATH)
+            self._profile_status_var.set(f"已通知机器人为“{name}”采集{label}特征，请配合提示操作...")
+
+            def wait_agent() -> None:
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    time.sleep(0.35)
+                    try:
+                        state = json.loads(IDENTITY_CONTROL_PATH.read_text(encoding="utf-8"))
+                    except (OSError, ValueError, TypeError):
+                        continue
+                    if state.get("id") != cmd_id:
+                        continue
+                    status = state.get("status")
+                    if status == "done":
+                        msg = str(state.get("message", f"{label}更新完成"))
+                        self._events.put(("profile_status", msg))
+                        self._events.put(("log", f"资料库：{msg}"))
+                        self._events.put(("profiles_refresh", ""))
+                        return
+                    if status == "error":
+                        msg = str(state.get("message", f"{label}采集失败"))
+                        self._events.put(("profile_status", f"失败：{msg}"))
+                        self._events.put(("error", msg))
+                        return
+                self._events.put(("profile_status", "等待机器人响应超时，请查看运行日志。"))
+
+            threading.Thread(target=wait_agent, daemon=True).start()
+            return
+
+        # Agent is offline: run enroll-identity.py directly.
+        self._profile_status_var.set(f"Agent 未运行，正在直接调用摄像头/麦克风采集{label}...")
+
+        def run_cli() -> None:
+            python_exe = VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable)
+            args = [
+                str(python_exe),
+                str(SCRIPTS / "enroll-identity.py"),
+                "--user",
+                user_id,
+                "--name",
+                name,
+                f"--{modality}",
+            ]
+            if replace:
+                args.append("--replace")
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            proc = subprocess.run(
+                args,
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+                timeout=45,
+            )
+            if proc.returncode == 0:
+                self._events.put(("profile_status", f"已为“{name}”完成{label}特征更新。"))
+                self._events.put(("log", proc.stdout.strip() or f"{label}采集成功"))
+                self._events.put(("profiles_refresh", ""))
+            else:
+                detail = proc.stderr.strip() or proc.stdout.strip() or f"{label}采集失败"
+                self._events.put(("profile_status", f"失败：{detail}"))
+                self._events.put(("error", detail))
+
+        threading.Thread(target=run_cli, daemon=True).start()
+
+    def _on_fact_select(self, _event=None) -> None:
+        selection = self.facts_tree.selection()
+        if not selection:
+            return
+        values = self.facts_tree.item(selection[0], "values")
+        if len(values) >= 3:
+            self._fact_key_var.set(str(values[0]))
+            self._fact_value_var.set(str(values[1]))
+            self._fact_visibility_var.set(str(values[2]))
+
+    def _upsert_fact(self) -> None:
+        user_id = self._selected_profile_id
+        if not user_id:
+            messagebox.showinfo("提示", "请先在左侧选择一名成员。")
+            return
+        key = self._fact_key_var.get().strip()
+        value = self._fact_value_var.get().strip()
+        if not key or not value:
+            messagebox.showerror("保存失败", "键名和内容不能为空。")
+            return
+        args = ["set-fact", "--user", user_id, "--key", key, "--value", value]
+        if self._fact_visibility_var.get() == "public":
+            args.append("--public")
+        try:
+            self._run_memory_admin(*args)
+            self._refresh_profiles()
+            self._profile_status_var.set(f"已保存记忆：{key}")
+        except Exception as exc:
+            messagebox.showerror("保存失败", str(exc))
+
+    def _delete_fact(self) -> None:
+        user_id = self._selected_profile_id
+        key = self._fact_key_var.get().strip()
+        if not user_id or not key:
+            return
+        try:
+            self._run_memory_admin("delete-fact", "--user", user_id, "--key", key)
+            self._fact_key_var.set("")
+            self._fact_value_var.set("")
+            self._refresh_profiles()
+            self._profile_status_var.set(f"已删除记忆：{key}")
+        except Exception as exc:
+            messagebox.showerror("删除失败", str(exc))
 
 if __name__ == "__main__":
     if not acquire_control_single_instance():

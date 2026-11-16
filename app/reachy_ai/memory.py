@@ -157,6 +157,59 @@ class MemoryStore:
     def user_ids(self) -> list[str]:
         return [str(row[0]) for row in self.connection.execute("SELECT user_id FROM users")]
 
+    def list_profiles(self) -> list[dict[str, Any]]:
+        """Return all users with template and memory counts for management UI/CLI."""
+        rows = self.connection.execute(
+            """
+            SELECT
+                u.user_id,
+                u.display_name,
+                u.created_at,
+                u.updated_at,
+                (SELECT COUNT(*) FROM biometric_templates b WHERE b.user_id=u.user_id AND b.modality='face') AS face_count,
+                (SELECT COUNT(*) FROM biometric_templates b WHERE b.user_id=u.user_id AND b.modality='voice') AS voice_count,
+                (SELECT COUNT(*) FROM facts f WHERE f.user_id=u.user_id) AS fact_count,
+                (SELECT COUNT(*) FROM episodes e WHERE e.user_id=u.user_id) AS episode_count
+            FROM users u
+            ORDER BY u.updated_at DESC, u.user_id ASC
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def rename_user(self, user_id: str, new_name: str) -> None:
+        """Update display name and canonical preferred_name fact together."""
+        cleaned = str(new_name).strip()
+        if not cleaned:
+            raise ValueError("新名字不能为空")
+        now = _now()
+        self.ensure_user(user_id, cleaned)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE users SET display_name=?, updated_at=? WHERE user_id=?",
+                (cleaned, now, user_id),
+            )
+            self.connection.execute(
+                "DELETE FROM facts WHERE user_id=? AND key='name'",
+                (user_id,),
+            )
+        self.upsert_fact(
+            user_id,
+            "preferred_name",
+            cleaned,
+            visibility="public",
+            confidence=1.0,
+            source="admin",
+        )
+        self.remember_official_fact(user_id, f"The user prefers to be called {cleaned}.")
+
+    def delete_user(self, user_id: str) -> bool:
+        """Delete a user profile and cascade-remove its templates and memory."""
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM users WHERE user_id=?", (user_id,)
+            )
+        return cursor.rowcount > 0
+
     def reconcile_identity_metadata(self) -> None:
         """Apply model-written canonical name facts to identity display labels."""
         rows = self.connection.execute(
@@ -291,6 +344,13 @@ class MemoryStore:
         sql += " ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
         return [dict(row) for row in self.connection.execute(sql, params)]
+
+    def delete_fact(self, user_id: str, key: str) -> bool:
+        with self.connection:
+            cursor = self.connection.execute(
+                "DELETE FROM facts WHERE user_id=? AND key=?", (user_id, key)
+            )
+        return cursor.rowcount > 0
 
     def add_episode(self, user_id: str, summary: str, importance: float = 0.5) -> None:
         self.ensure_user(user_id)
@@ -439,6 +499,21 @@ class MemoryStore:
             (user_id, modality),
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def clear_biometrics(self, user_id: str, modality: str | None = None) -> int:
+        """Delete stored face/voice templates for user_id (or all modalities if None)."""
+        with self.connection:
+            if modality:
+                cursor = self.connection.execute(
+                    "DELETE FROM biometric_templates WHERE user_id=? AND modality=?",
+                    (user_id, modality),
+                )
+            else:
+                cursor = self.connection.execute(
+                    "DELETE FROM biometric_templates WHERE user_id=?",
+                    (user_id,),
+                )
+        return cursor.rowcount
 
     def biometric_templates(self, modality: str) -> list[tuple[str, Any, float]]:
         import numpy as np

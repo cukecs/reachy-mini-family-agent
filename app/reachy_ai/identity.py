@@ -338,3 +338,40 @@ def speaker_identity_from_voice(
             "voice-public",
         )
     return IdentityDecision(None, 0.0, False, "unknown")
+
+
+def resolve_speaker_identity(
+    voice: Match,
+    visible_faces: list[Match],
+    *,
+    stabilizer: IdentityStabilizer,
+    face_threshold: float = 0.68,
+) -> IdentityDecision:
+    """Prefer stabilized voice, then use a single current, reliable face.
+
+    Include *all* detected faces, even unmatched ones. One known face among
+    several people is not evidence that this person spoke. A face fallback is
+    a conversational assumption, not audiovisual proof or biometric enrolment.
+    Never use a remembered face/previous speaker when this frame has no match.
+    """
+    raw_voice = speaker_identity_from_voice(voice)
+    decision = stabilizer.update(raw_voice)
+    if decision.user_id:
+        return decision
+    if not visible_faces:
+        return decision
+    if len(visible_faces) != 1:
+        return IdentityDecision(None, 0.0, False, "face-multiple")
+    face = visible_faces[0]
+    if (
+        face.modality != "face"
+        or not face.user_id
+        or not np.isfinite(face.confidence)
+        or face.confidence < face_threshold
+    ):
+        return IdentityDecision(None, 0.0, False, "face-unmatched")
+    # A borderline voice candidate for another person must not silently turn
+    # a known bystander into the speaker. Keep accumulating voice evidence.
+    if raw_voice.user_id and raw_voice.user_id != face.user_id:
+        return IdentityDecision(None, 0.0, False, "face/voice conflict")
+    return IdentityDecision(face.user_id, face.confidence, False, "face-fallback")

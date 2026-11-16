@@ -51,8 +51,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 decision = self.orchestrator.route(payload.get("messages", []), payload.get("route"))
                 self._json(HTTPStatus.OK, decision.to_dict())
             elif self.path == "/v1/chat/completions":
-                response, _ = self.orchestrator.chat(payload)
-                self._json(HTTPStatus.OK, response)
+                if bool(payload.get("stream")):
+                    stream, _ = self.orchestrator.chat_stream(payload)
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    for chunk in stream:
+                        line = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                else:
+                    response, _ = self.orchestrator.chat(payload)
+                    self._json(HTTPStatus.OK, response)
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except (ValueError, json.JSONDecodeError) as exc:

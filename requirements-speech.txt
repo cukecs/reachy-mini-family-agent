@@ -2,3 +2,8 @@ sherpa-onnx==1.13.8
 sherpa-onnx-bin==1.13.8
 sherpa-onnx-core==1.13.8
 opencv-contrib-python==4.12.0.88
+pypinyin==0.55.0
+tokenizers==0.22.1
+onnxruntime==1.27.0
+# One-time local g2pW INT8 preparation (scripts/prepare-g2pw.py)
+onnx==1.20.1

@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--name", required=True, help="Display name")
     parser.add_argument("--face", action="store_true")
     parser.add_argument("--voice", action="store_true")
+    parser.add_argument("--replace", action="store_true", help="Replace existing templates for selected modalities")
     args = parser.parse_args()
     if not args.face and not args.voice:
         parser.error("Choose --face, --voice, or both")
@@ -39,7 +40,7 @@ def main() -> None:
     ) as reachy:
         if face:
             print("Look at Reachy and slowly turn your head a little left and right.")
-            enrolled = 0
+            captured_faces: list[tuple[np.ndarray, float]] = []
             for index in range(5):
                 frame = capture_reachy_frame(reachy.media, timeout_seconds=4.0)
                 try:
@@ -47,12 +48,15 @@ def main() -> None:
                 except LookupError:
                     print(f"Face sample {index + 1}: no face")
                 else:
-                    store.add_biometric(args.user, "face", embedding, quality)
-                    enrolled += 1
-                    print(f"Face sample {index + 1}: saved (quality={quality:.3f})")
+                    captured_faces.append((embedding, quality))
+                    print(f"Face sample {index + 1}: captured (quality={quality:.3f})")
                 time.sleep(0.4)
-            if enrolled < 3:
+            if len(captured_faces) < 3:
                 raise RuntimeError("Fewer than three usable face samples were captured")
+            if args.replace:
+                store.clear_biometrics(args.user, "face")
+            for embedding, quality in captured_faces:
+                store.add_biometric(args.user, "face", embedding, quality)
 
         if voice:
             print("Speak naturally for at least five seconds after the prompt.")
@@ -61,6 +65,8 @@ def main() -> None:
             )
             print(f"ASR heard: {text}")
             embedding = voice.embedding(audio, sample_rate)
+            if args.replace:
+                store.clear_biometrics(args.user, "voice")
             store.add_biometric(args.user, "voice", embedding, quality=1.0)
             print("Voice sample saved.")
 

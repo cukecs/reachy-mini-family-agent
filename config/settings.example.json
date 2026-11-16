@@ -37,5 +37,18 @@
     "cloud_history_token_budget": 900000,
     "history_max_messages": 5000
   },
-  "identity": {"family_mode": true}
+  "identity": {"family_mode": true},
+  "speech_filter": {
+    "enabled": true,
+    "threshold": 0.58,
+    "min_speech_seconds": 0.2,
+    "min_contiguous_seconds": 0.128,
+    "min_rms": 0.004
+  },
+  "conversation_gate": {
+    "enabled": true,
+    "mode": "wake_word",
+    "wake_words": ["天线宝宝", "Reachy"],
+    "active_window_seconds": 45
+  }
 }
