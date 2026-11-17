@@ -21,6 +21,12 @@ $env:LLAMA_API_KEY = $localApiKey
 $env:DEEPSEEK_API_KEY = [Environment]::GetEnvironmentVariable(
     'DEEPSEEK_API_KEY', 'User'
 )
+$env:ZHIPU_API_KEY = [Environment]::GetEnvironmentVariable(
+    'ZHIPU_API_KEY', 'User'
+)
+$env:MODELSCOPE_API_KEY = [Environment]::GetEnvironmentVariable(
+    'MODELSCOPE_API_KEY', 'User'
+)
 
 if (-not (Get-NetTCPConnection -LocalPort $modelConfig.port -State Listen -ErrorAction SilentlyContinue)) {
     $llamaArgs = @(

@@ -190,6 +190,7 @@ class ReachyConsole(tk.Tk):
         self._singing_vars: dict[str, tk.StringVar] = {}
         self._speech_filter_vars: dict[str, tk.StringVar] = {}
         self._gate_vars: dict[str, tk.StringVar] = {}
+        self._dev_vars: dict[str, tk.StringVar] = {}
         self._selected_profile_id: str | None = None
         self._profile_name_var = tk.StringVar()
         self._profile_id_var = tk.StringVar()
@@ -593,8 +594,34 @@ class ReachyConsole(tk.Tk):
             self._gate_vars[field] = variable
             ttk.Entry(cell, textvariable=variable).pack(fill="x")
 
+        dev_box = ttk.LabelFrame(body, text="开发调试与远程连接（Web / IDE MCP）", padding=12)
+        dev_box.grid(row=6, column=0, columnspan=3, sticky="ew", padx=6, pady=8)
+        dev_fields = [
+            ("enabled", "启用开发调试接口"),
+            ("listen_host", "监听地址（127.0.0.1=仅本机 / 0.0.0.0=局域网远程）"),
+            ("listen_port", "端口"),
+            ("allow_code_edit", "允许远程/Agent 改代码"),
+        ]
+        for column, (field, label) in enumerate(dev_fields):
+            cell = ttk.Frame(dev_box, style="Panel.TFrame")
+            cell.grid(row=0, column=column, sticky="ew", padx=6, pady=5)
+            dev_box.columnconfigure(column, weight=1)
+            ttk.Label(cell, text=label, style="Muted.TLabel").pack(anchor="w")
+            variable = tk.StringVar()
+            self._dev_vars[field] = variable
+            ttk.Entry(cell, textvariable=variable).pack(fill="x")
+        dev_actions = ttk.Frame(dev_box, style="Panel.TFrame", padding=(6, 4))
+        dev_actions.grid(row=1, column=0, columnspan=4, sticky="ew")
+        ttk.Button(dev_actions, text="打开 Web 调试台", command=self._open_dev_web).pack(side="left", padx=(0, 8))
+        ttk.Button(dev_actions, text="复制远程访问 Token", command=self._copy_dev_token).pack(side="left", padx=(0, 8))
+        ttk.Label(
+            dev_actions,
+            text="IDE MCP 地址：http://<IP>:<端口>/mcp（非本机需 Bearer Token）",
+            style="Muted.TLabel",
+        ).pack(side="left")
+
         controls = ttk.Frame(body, style="Panel.TFrame", padding=(6, 10))
-        controls.grid(row=6, column=0, columnspan=3, sticky="ew")
+        controls.grid(row=7, column=0, columnspan=3, sticky="ew")
         ttk.Button(controls, text="重新载入", command=self._load_settings).pack(side="left", padx=4)
         ttk.Button(controls, text="仅保存", command=self._save_settings).pack(side="left", padx=4)
         ttk.Button(
@@ -728,6 +755,32 @@ class ReachyConsole(tk.Tk):
         filename = filedialog.askopenfilename(initialdir=initial.parent if initial.suffix else initial)
         if filename:
             self._runtime_vars[field].set(filename.replace("/", "\\"))
+
+    def _open_dev_web(self) -> None:
+        host = self._dev_vars["listen_host"].get().strip() or "127.0.0.1"
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        port = self._dev_vars["listen_port"].get().strip() or "8078"
+        webbrowser.open(f"http://{host}:{port}/")
+
+    def _copy_dev_token(self) -> None:
+        token_path = ROOT / "data" / "dev-token.txt"
+        token = os.environ.get("REACHY_DEV_TOKEN", "").strip()
+        if not token:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+                    token = str(winreg.QueryValueEx(key, "REACHY_DEV_TOKEN")[0]).strip()
+            except (FileNotFoundError, OSError):
+                pass
+        if not token and token_path.exists():
+            token = token_path.read_text(encoding="utf-8").strip()
+        if not token:
+            messagebox.showinfo("提示", "远程 Token 将在首次启动 AI 路由后生成于 data\\dev-token.txt。")
+            return
+        self.clipboard_clear()
+        self.clipboard_append(token)
+        self._log("已复制远程开发调试 Token 到剪贴板。")
+        messagebox.showinfo("已复制", "远程访问 Token 已复制到剪贴板。")
 
     @staticmethod
     def _legacy_models(settings: dict) -> list[dict]:
@@ -1031,6 +1084,17 @@ class ReachyConsole(tk.Tk):
                     variable.set(", ".join(str(item) for item in value))
                 else:
                     variable.set(str(value))
+
+            dev_cfg = settings.get("dev_interface", {})
+            dev_defaults = {
+                "enabled": True,
+                "listen_host": "127.0.0.1",
+                "listen_port": 8078,
+                "allow_code_edit": False,
+            }
+            for field, variable in self._dev_vars.items():
+                value = dev_cfg.get(field, dev_defaults[field])
+                variable.set(str(value).lower() if isinstance(value, bool) else str(value))
             self._log("已载入模型和 API 配置。")
         except Exception as exc:
             messagebox.showerror("配置读取失败", str(exc))
@@ -1155,6 +1219,22 @@ class ReachyConsole(tk.Tk):
             gate["active_window_seconds"] = self._convert_number(
                 self._gate_vars["active_window_seconds"].get(), float, "连续对话窗口"
             )
+
+            dev_enabled = self._dev_vars["enabled"].get().strip().lower()
+            dev_edit = self._dev_vars["allow_code_edit"].get().strip().lower()
+            if dev_enabled not in {"true", "false", "1", "0", "yes", "no"}:
+                raise ValueError("开发调试接口开关必须填写 true 或 false")
+            if dev_edit not in {"true", "false", "1", "0", "yes", "no"}:
+                raise ValueError("允许改代码开关必须填写 true 或 false")
+            dev_cfg = settings.setdefault("dev_interface", {})
+            dev_cfg["enabled"] = dev_enabled in {"true", "1", "yes"}
+            dev_cfg["listen_host"] = self._dev_vars["listen_host"].get().strip() or "127.0.0.1"
+            dev_cfg["listen_port"] = self._convert_number(
+                self._dev_vars["listen_port"].get(), int, "开发调试端口"
+            )
+            dev_cfg["allow_code_edit"] = dev_edit in {"true", "1", "yes"}
+            dev_cfg.setdefault("token_env", "REACHY_DEV_TOKEN")
+            dev_cfg.setdefault("allow_remote_control", True)
 
             for field in ("server_path", "model_path", "mmproj_path", "alias", "host", "cache_type_k", "cache_type_v"):
                 runtime[field] = self._runtime_vars[field].get().strip()

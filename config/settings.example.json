@@ -23,6 +23,28 @@
       "max_tokens": 2048,
       "temperature": 0.6,
       "extra_body": {}
+    },
+    {
+      "id": "zhipu-flash-250414",
+      "name": "智谱免费 GLM-4-Flash-250414",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "model": "glm-4-flash-250414",
+      "api_key_env": "ZHIPU_API_KEY",
+      "timeout_seconds": 120,
+      "max_tokens": 2048,
+      "temperature": 0.6,
+      "extra_body": {}
+    },
+    {
+      "id": "modelscope-qwen3.5-397b",
+      "name": "魔搭 Qwen3.5-397B-A17B",
+      "base_url": "https://api-inference.modelscope.cn/v1",
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "api_key_env": "MODELSCOPE_API_KEY",
+      "timeout_seconds": 180,
+      "max_tokens": 2048,
+      "temperature": 0.6,
+      "extra_body": {"enable_thinking": false}
     }
   ],
   "router": {
@@ -50,5 +72,13 @@
     "mode": "wake_word",
     "wake_words": ["天线宝宝", "Reachy"],
     "active_window_seconds": 45
+  },
+  "dev_interface": {
+    "enabled": true,
+    "listen_host": "127.0.0.1",
+    "listen_port": 8078,
+    "token_env": "REACHY_DEV_TOKEN",
+    "allow_code_edit": false,
+    "allow_remote_control": true
   }
 }

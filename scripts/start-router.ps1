@@ -9,6 +9,12 @@ $env:AUTOWAKE_API_KEY = [Environment]::GetEnvironmentVariable(
 $env:DEEPSEEK_API_KEY = [Environment]::GetEnvironmentVariable(
     'DEEPSEEK_API_KEY', 'User'
 )
+$env:ZHIPU_API_KEY = [Environment]::GetEnvironmentVariable(
+    'ZHIPU_API_KEY', 'User'
+)
+$env:MODELSCOPE_API_KEY = [Environment]::GetEnvironmentVariable(
+    'MODELSCOPE_API_KEY', 'User'
+)
 $python = 'D:\ReachyAI\.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python)) {
     throw "Required Python environment is missing: $python"

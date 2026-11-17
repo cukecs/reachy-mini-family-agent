@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .config import DEFAULT_CONFIG, load_config
+from .dev_server import start_dev_server_background
+from .dev_tools import DevInterfaceConfig
 from .openai_client import ModelError
 from .orchestrator import Orchestrator
 
@@ -81,6 +83,8 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     args = parser.parse_args()
     config = load_config(args.config)
+    dev_config = DevInterfaceConfig.load(args.config)
+    dev_server = start_dev_server_background(dev_config)
     orchestrator = Orchestrator(config)
     ApiHandler.orchestrator = orchestrator
     server = ThreadingHTTPServer((config.listen_host, config.listen_port), ApiHandler)
@@ -91,6 +95,9 @@ def main() -> None:
         pass
     finally:
         server.server_close()
+        if dev_server is not None:
+            dev_server.shutdown()
+            dev_server.server_close()
 
 
 if __name__ == "__main__":

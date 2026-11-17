@@ -16,6 +16,17 @@ import cv2
 import numpy as np
 
 from .conversation_gate import ConversationGate
+from .dev_tools import (
+    DEV_COMMAND_PATH,
+    DevInterfaceConfig,
+    dev_diagnostics,
+    dev_edit_file,
+    dev_git_status,
+    dev_list_files,
+    dev_read_file,
+    dev_run_tests,
+    dev_search_code,
+)
 from .english_pronunciation import (
     EnglishPronunciationAssessor,
     extract_english_words,
@@ -200,6 +211,8 @@ SYSTEM_PROMPT = (
     "若当前轮次没有工具调用，也可在回答末尾添加隐藏标签：[[RENAME_USER:新名字]]、[[RENAME_USER:原名字=>新名字]]、"
     "[[FORGET:键名或关键词]]、[[UPDATE_BIOMETRIC:voice:replace]]、[[UPDATE_BIOMETRIC:face:replace]]、[[CLEAR_BIOMETRIC:face|voice]]。"
     "不要受历史对话中早期回复‘接口未开放’的干扰，以当前真实工具执行结果为准；未调用工具或标签前，绝不能口头假装已经修改成功。"
+    "你还配备了本机开发与调试工具（dev_diagnostics、dev_list_files、dev_read_file、dev_search_code、dev_git_status、dev_run_tests、dev_edit_file），"
+    "当用户询问你的源码结构、运行状态、日志报错、Git 状态或让你运行单元测试调试时，直接调用这些工具给出实测结果。"
 )
 
 REMEMBER_TAG = re.compile(
@@ -755,6 +768,97 @@ PROFILE_TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+DEV_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "dev_diagnostics",
+            "description": "检查 Reachy 后台、路由器、进程内存、摄像头延迟及最新状态快照。",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dev_list_files",
+            "description": "列出项目工作区允许访问的源码、测试、脚本或日志文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subdir": {"type": "string", "description": "如 app, scripts, tests, logs, docs"},
+                    "pattern": {"type": "string", "description": "通配符，如 *.py"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dev_read_file",
+            "description": "按行范围读取项目源码或日志文件。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dev_search_code",
+            "description": "在工作区代码中搜索关键字或正则表达式。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "subdir": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dev_git_status",
+            "description": "查看当前项目 Git 分支状态和最近提交记录。",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dev_run_tests",
+            "description": "运行 D:\\ReachyAI\\tests 单元测试并返回通过或失败结果。",
+            "parameters": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "dev_edit_file",
+            "description": "精确替换源码文件中的一个文本块（需先开启 dev_interface.allow_code_edit 且身份已确认）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "target": {"type": "string"},
+                    "replacement": {"type": "string"},
+                },
+                "required": ["path", "target", "replacement"],
+            },
+        },
+    },
+]
+
 
 class RobotBrain:
     def __init__(
@@ -1054,6 +1158,41 @@ class RobotBrain:
             if modality not in pending_clear_bio:
                 pending_clear_bio.append(modality)
             return {"ok": True, "scheduled": True, "modality": modality}
+        try:
+            if name == "dev_diagnostics":
+                return dev_diagnostics()
+            if name == "dev_list_files":
+                return dev_list_files(
+                    str(arguments.get("subdir", "app")),
+                    str(arguments.get("pattern", "*")),
+                )
+            if name == "dev_read_file":
+                return dev_read_file(
+                    str(arguments.get("path", "")),
+                    int(arguments.get("start_line", 1)),
+                    int(arguments.get("end_line", 160)),
+                )
+            if name == "dev_search_code":
+                return dev_search_code(
+                    str(arguments.get("query", "")),
+                    str(arguments.get("subdir", "app")),
+                )
+            if name == "dev_git_status":
+                return dev_git_status()
+            if name == "dev_run_tests":
+                return dev_run_tests(str(arguments.get("pattern", "")))
+            if name == "dev_edit_file":
+                if not self._is_confirmed_identity():
+                    return {"ok": False, "error": "需要已确认的主人/家庭成员身份才能修改代码"}
+                dev_cfg = DevInterfaceConfig.load()
+                return dev_edit_file(
+                    str(arguments.get("path", "")),
+                    str(arguments.get("target", "")),
+                    str(arguments.get("replacement", "")),
+                    allow_code_edit=dev_cfg.allow_code_edit,
+                )
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
         return {"ok": False, "error": f"未知工具：{name}"}
 
     def _chat_with_tools(
@@ -1081,13 +1220,15 @@ class RobotBrain:
 
         working = [dict(msg) for msg in messages]
         router_meta: dict[str, Any] = {}
+        dev_enabled = DevInterfaceConfig.load().enabled
+        available_tools = [*PROFILE_TOOLS, *DEV_TOOLS] if dev_enabled else PROFILE_TOOLS
         for _ in range(4):
             payload: dict[str, Any] = {
                 "model": "reachy-auto",
                 "messages": working,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
-                "tools": PROFILE_TOOLS,
+                "tools": available_tools,
                 "tool_choice": "auto",
             }
             if route:
@@ -2056,10 +2197,89 @@ def run_robot() -> None:
                 speak(reachy.media, f"资料库特征更新失败：{exc}", record_history=False)
             _write_identity_control(result_payload)
 
+        def _read_dev_command() -> dict[str, Any] | None:
+            try:
+                payload = json.loads(DEV_COMMAND_PATH.read_text(encoding="utf-8"))
+                if isinstance(payload, dict) and payload.get("status") == "pending":
+                    return payload
+            except (OSError, ValueError, TypeError):
+                pass
+            return None
+
+        def _write_dev_command(payload: dict[str, Any]) -> None:
+            DEV_COMMAND_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = DEV_COMMAND_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(DEV_COMMAND_PATH)
+
+        def _has_pending_control() -> bool:
+            return _has_pending_identity_control() or _read_dev_command() is not None
+
+        def _process_dev_command(cmd: dict[str, Any]) -> None:
+            action = str(cmd.get("action", "")).strip().lower()
+            text = str(cmd.get("text", "")).strip()
+            result = dict(cmd)
+            try:
+                if action == "wake":
+                    conversation_gate.wake()
+                    result["status"] = "done"
+                    result["ok"] = True
+                    result["message"] = "已唤醒连续对话窗口"
+                elif action == "sleep":
+                    conversation_gate.sleep()
+                    result["status"] = "done"
+                    result["ok"] = True
+                    result["message"] = "已切回待机模式"
+                elif action == "say":
+                    speak(reachy.media, text, route="remote-dev")
+                    result["status"] = "done"
+                    result["ok"] = True
+                    result["message"] = "已朗读"
+                elif action == "ask":
+                    conversation_gate.wake()
+                    runtime_state.event("user", text, route="remote-dev")
+                    brain.record_user(text)
+                    reply_text, reply_route = brain.answer(text, None, history_text=text)
+                    active = str(reply_route.get("model_id") or reply_route.get("route", "remote"))
+                    if reply_route.get("actions"):
+                        try:
+                            perform_actions(reachy, reply_route["actions"])
+                        except Exception:
+                            pass
+                    if reply_route.get("emotions"):
+                        try:
+                            perform_emotions(reachy, reply_route["emotions"])
+                        except Exception:
+                            pass
+                    speak(
+                        reachy.media,
+                        _clean_for_speech(reply_text),
+                        route=active,
+                        record_history=False,
+                        display_text=reply_text,
+                    )
+                    result["status"] = "done"
+                    result["ok"] = True
+                    result["reply"] = reply_text
+                    result["route"] = reply_route
+                else:
+                    result["status"] = "error"
+                    result["ok"] = False
+                    result["message"] = f"未知远程动作：{action}"
+            except Exception as exc:
+                result["status"] = "error"
+                result["ok"] = False
+                result["message"] = str(exc)
+            _write_dev_command(result)
+
         while True:
             pending_cmd = _read_identity_control()
             if pending_cmd is not None:
                 _process_identity_control(pending_cmd)
+                continue
+            pending_dev = _read_dev_command()
+            if pending_dev is not None:
+                _process_dev_command(pending_dev)
                 continue
             pitch_capture = pitch_listen_pending
             pitch_listen_pending = False
@@ -2074,11 +2294,15 @@ def run_robot() -> None:
                 utterance, voice_audio, sample_rate = speech.listen_once_with_audio(
                     reachy.media,
                     timeout_seconds=12.0,
-                    abort_check=_has_pending_identity_control,
+                    abort_check=_has_pending_control,
                 )
             pending_cmd = _read_identity_control()
             if pending_cmd is not None:
                 _process_identity_control(pending_cmd)
+                continue
+            pending_dev = _read_dev_command()
+            if pending_dev is not None:
+                _process_dev_command(pending_dev)
                 continue
             pitch_analysis = None
             model_utterance = utterance

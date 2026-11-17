@@ -17,6 +17,14 @@ SEARCH_TRIGGER = re.compile(
     r"search (?:the )?web|look (?:it|this|that) up|latest|today'?s news|current (?:price|news|events)",
     re.IGNORECASE,
 )
+_LOCAL_QUERY_EXCLUSION = re.compile(
+    r"源码|代码|文件|日志|单元测试|测试用例|git|函数|方法|资料库|档案|特征|声纹|人脸|\.py\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_WEB_SEARCH = re.compile(
+    r"联网|网上查|上网|search (?:the )?web",
+    re.IGNORECASE,
+)
 WEATHER_TRIGGER = re.compile(
     r"天气|气温|温度|下雨|降雨|下雪|台风|weather|forecast|temperature",
     re.IGNORECASE,
@@ -350,6 +358,8 @@ def select_network_tool(text: str) -> tuple[str, dict[str, Any]] | None:
     if TIME_TRIGGER.search(text):
         return "time", _time_arguments(text)
     if SEARCH_TRIGGER.search(text):
+        if _LOCAL_QUERY_EXCLUSION.search(text) and not _EXPLICIT_WEB_SEARCH.search(text):
+            return None
         return "search", {"query": _search_query(text), "max_results": 5}
     return None
 
