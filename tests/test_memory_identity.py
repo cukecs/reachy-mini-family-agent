@@ -31,7 +31,12 @@ from reachy_ai.robot_agent import (
     extract_robot_name,
     extract_self_declared_surname,
     extract_self_introduced_name,
+    extract_stranger_reply_name,
     extract_third_person_name,
+    is_affirmative_face_enroll_reply,
+    is_negative_face_enroll_reply,
+    is_stranger_name_refusal,
+    is_unfamiliar_speaker,
     strip_memory_tags,
 )
 
@@ -428,6 +433,84 @@ class MemoryIdentityTests(unittest.TestCase):
             "我叫另一个名字", "记住了。", [("preferred_name", "错误名字")]
         )
         self.assertEqual(self.store.user_name("owner"), "Owner")
+
+    def test_stranger_reply_name_and_refusal(self) -> None:
+        self.assertEqual(extract_stranger_reply_name("我叫小红"), "小红")
+        self.assertEqual(extract_stranger_reply_name("我是小张。"), "小张")
+        self.assertEqual(extract_stranger_reply_name("叫我老王吧"), "老王")
+        self.assertEqual(extract_stranger_reply_name("小美呀"), "小美")
+        self.assertEqual(extract_stranger_reply_name("张明远"), "张明远")
+        self.assertEqual(extract_stranger_reply_name("Alice"), "Alice")
+        self.assertEqual(extract_stranger_reply_name("Bob Chen"), "Bob Chen")
+        self.assertIsNone(extract_stranger_reply_name("我是来问天气的"))
+        self.assertIsNone(extract_stranger_reply_name("我叫什么名字？"))
+        self.assertIsNone(extract_stranger_reply_name("帮我查一下明天天气"))
+        self.assertIsNone(extract_stranger_reply_name("不想说"))
+        self.assertTrue(is_stranger_name_refusal("保密"))
+        self.assertTrue(is_stranger_name_refusal("先别问了"))
+        self.assertFalse(is_stranger_name_refusal("小红"))
+
+    def test_face_enroll_confirmation_replies(self) -> None:
+        self.assertTrue(is_affirmative_face_enroll_reply("好的"))
+        self.assertTrue(is_affirmative_face_enroll_reply("可以，记住吧"))
+        self.assertTrue(is_affirmative_face_enroll_reply("ok"))
+        self.assertFalse(is_affirmative_face_enroll_reply("不用了"))
+        self.assertFalse(is_affirmative_face_enroll_reply("今天天气真好"))
+        self.assertTrue(is_negative_face_enroll_reply("不用了"))
+        self.assertTrue(is_negative_face_enroll_reply("下次再说"))
+        self.assertFalse(is_negative_face_enroll_reply("好的"))
+
+    def test_is_unfamiliar_speaker_respects_ambiguity_and_known_faces(self) -> None:
+        self.assertTrue(
+            is_unfamiliar_speaker(
+                identity=IdentityDecision(None, 0.0, False, "unknown"),
+                voice_match=Match(None, 0.22, "voice"),
+                face_match=Match(None, 0.20, "face"),
+                face_observations=[],
+                has_voice_embedding=True,
+                voice_templates_count=2,
+            )
+        )
+        self.assertFalse(
+            is_unfamiliar_speaker(
+                identity=IdentityDecision(None, 0.0, False, "voice-pending"),
+                voice_match=Match("owner", 0.58, "voice"),
+                face_match=Match(None, 0.0, "face"),
+                face_observations=[],
+                has_voice_embedding=True,
+                voice_templates_count=2,
+            )
+        )
+        self.assertFalse(
+            is_unfamiliar_speaker(
+                identity=IdentityDecision(None, 0.0, False, "unknown"),
+                voice_match=Match(None, 0.51, "voice", "owner"),
+                face_match=Match(None, 0.0, "face"),
+                face_observations=[],
+                has_voice_embedding=True,
+                voice_templates_count=2,
+            )
+        )
+        self.assertFalse(
+            is_unfamiliar_speaker(
+                identity=IdentityDecision(None, 0.0, False, "face-multiple"),
+                voice_match=Match(None, 0.15, "voice"),
+                face_match=Match(None, 0.0, "face"),
+                face_observations=[object(), object()],
+                has_voice_embedding=True,
+                voice_templates_count=2,
+            )
+        )
+        self.assertFalse(
+            is_unfamiliar_speaker(
+                identity=IdentityDecision(None, 0.0, False, "unknown"),
+                voice_match=Match(None, 0.0, "voice"),
+                face_match=Match("owner", 0.62, "face"),
+                face_observations=[object()],
+                has_voice_embedding=False,
+                voice_templates_count=2,
+            )
+        )
 
 
 if __name__ == "__main__":

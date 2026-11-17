@@ -330,6 +330,144 @@ def extract_self_introduced_name(text: str) -> str | None:
     return None
 
 
+_STRANGER_NAME_REFUSAL = re.compile(
+    r"(?:不想说|不方便说|不告诉你|秘密|保密|别问|先别问|不用问|算了|不用记|不用了|随便|不知道|没名字)",
+    re.IGNORECASE,
+)
+_NON_NAME_REPLIES = {
+    "你好", "您好", "嗨", "哈喽", "在吗", "在不在", "好的", "好吧", "可以", "行",
+    "嗯", "恩", "啊", "哦", "没有", "不是", "是的", "对", "对呀", "不知道", "没事",
+    "没关系", "不用", "不要", "算了", "随便", "秘密", "保密", "退出", "结束",
+    "再见", "拜拜", "天线宝宝", "reachy", "天气", "今天", "明天", "昨天", "谢谢",
+    "你好呀", "hello", "hi", "hey", "ok", "okay", "yes", "no", "nope", "skip",
+}
+_NON_NAME_FRAGMENTS = (
+    "什么", "谁", "哪", "吗", "怎么", "为什么", "多少", "几个", "天气", "帮我",
+    "请问", "听不见", "说什么", "干嘛", "做啥", "来问", "来说", "是说", "的意思",
+    "想问", "想要", "过来", "测试", "你的", "说话", "聊天", "唱歌", "听歌",
+)
+_FACE_CONFIRM_NEGATIVE = re.compile(
+    r"(?:不用|不要|不需要|算了|先不|别|下次|改天|暂时不|no|nope|not now|skip)",
+    re.IGNORECASE,
+)
+_FACE_CONFIRM_POSITIVE = re.compile(
+    r"^(?:(?:好的?|行|可以|没问题|嗯+|恩+|对|是|要|行啊|好啊|好呀|可以呀|好哒|ok|okay|yes|yeah|sure|please)[，,\s]*)+$"
+    r"|(?:记住|保存|录入|拍|存)(?:一下|进去|吧|呀|好了|也行|可以)?[。！？.!?\s]*$",
+    re.IGNORECASE,
+)
+
+
+def is_stranger_name_refusal(text: str) -> bool:
+    """Return True if the user explicitly declines giving their name."""
+    normalized = str(text or "").strip()
+    return bool(normalized and _STRANGER_NAME_REFUSAL.search(normalized))
+
+
+def extract_stranger_reply_name(text: str) -> str | None:
+    """Extract a name only right after the robot proactively asked who is speaking."""
+    normalized = str(text or "").strip()
+    if not normalized or is_stranger_name_refusal(normalized):
+        return None
+    if not re.search(r"[？?]", normalized) and not any(
+        frag in normalized for frag in _NON_NAME_FRAGMENTS
+    ):
+        iam_cjk = re.fullmatch(
+            r"(?:(?:你好|您好|嗯|呃|额|对|哦)[，,\s]*)?(?:我是|我叫|叫我|你叫我|请叫我|以后叫我)\s*"
+            r"([\u3400-\u9fff\u00b7]{1,6}?)\s*(?:就好|就行了?|即可|呀|啊|呢|吧|哦|啦)?[。！？.!?,，\s]*",
+            normalized,
+            re.IGNORECASE,
+        )
+        if iam_cjk:
+            candidate = iam_cjk.group(1).strip()
+            if candidate.casefold() not in _NON_NAME_REPLIES and not any(
+                frag in candidate for frag in _NON_NAME_FRAGMENTS
+            ):
+                return candidate
+    explicit = extract_self_introduced_name(text)
+    if explicit:
+        return explicit
+    if re.search(r"[？?]", normalized):
+        return None
+    if any(frag in normalized for frag in _NON_NAME_FRAGMENTS):
+        return None
+    iam_en = re.fullmatch(
+        r"(?:(?:hello|hi|hey|um|uh)[,.\s]*)?(?:i am|i'm|我是|叫我)\s+"
+        r"([A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){0,2})\s*[。！？.!?,，\s]*",
+        normalized,
+        re.IGNORECASE,
+    )
+    if iam_en:
+        candidate = re.sub(r"\s+", " ", iam_en.group(1)).strip()
+        if candidate.casefold() not in _NON_NAME_REPLIES:
+            return candidate
+    bare = re.sub(r"^(?:嗯|呃|额|哦|就叫|叫)[，,\s]*", "", normalized).strip(
+        " 。！？.!?,，、\"'“”‘’"
+    )
+    if not bare:
+        return None
+    bare_en = re.fullmatch(
+        r"([A-Za-z][A-Za-z'\-]*(?:\s+[A-Za-z][A-Za-z'\-]*){0,2})(?:[呀啊呢吧哦啦])?",
+        bare,
+    )
+    if bare_en:
+        candidate = re.sub(r"\s+", " ", bare_en.group(1)).strip()
+        if candidate.casefold() not in _NON_NAME_REPLIES and 2 <= len(candidate) <= 32:
+            return candidate
+        return None
+    if re.fullmatch(r"[\u3400-\u9fff\u00b7]{1,7}", bare):
+        candidate = bare
+        if len(candidate) >= 3 and candidate[-1] in "呀啊呢吧哦哈啦嘛":
+            candidate = candidate[:-1]
+        if 1 <= len(candidate) <= 6 and candidate.casefold() not in _NON_NAME_REPLIES:
+            return candidate
+    return None
+
+
+def is_negative_face_enroll_reply(text: str) -> bool:
+    """Return True if the user declines saving their face image."""
+    normalized = str(text or "").strip(" 。！？.!?,，、 \t\r\n")
+    return bool(normalized and _FACE_CONFIRM_NEGATIVE.search(normalized))
+
+
+def is_affirmative_face_enroll_reply(text: str) -> bool:
+    """Return True if the user agrees to save their face after voice enrollment."""
+    normalized = str(text or "").strip(" 。！？.!?,，、 \t\r\n")
+    if not normalized or is_negative_face_enroll_reply(normalized):
+        return False
+    return bool(_FACE_CONFIRM_POSITIVE.search(normalized))
+
+
+def is_unfamiliar_speaker(
+    *,
+    identity: Any,
+    voice_match: Any,
+    face_match: Any,
+    face_observations: list[Any],
+    has_voice_embedding: bool,
+    voice_templates_count: int,
+) -> bool:
+    """Return True only when biometrics indicate an unfamiliar speaker, not ambiguity."""
+    if getattr(identity, "user_id", None):
+        return False
+    if getattr(identity, "reason", "") in (
+        "voice-pending",
+        "face-multiple",
+        "face/voice conflict",
+    ):
+        return False
+    if getattr(voice_match, "user_id", None):
+        return False
+    if float(getattr(voice_match, "confidence", 0.0) or 0.0) >= 0.45:
+        return False
+    if getattr(face_match, "user_id", None):
+        return False
+    if voice_templates_count == 0:
+        return True
+    if has_voice_embedding:
+        return True
+    return len(face_observations) == 1
+
+
 def extract_third_person_name(text: str) -> str | None:
     """Extract an explicit introduction of another person, never a question."""
     normalized = text.strip()
@@ -1980,6 +2118,14 @@ def run_robot() -> None:
     identity_stabilizer = IdentityStabilizer()
     greeted_user_ids: set[str] = set()
     startup_greeted = False
+    awaiting_stranger_name = False
+    pending_stranger_voice: np.ndarray | None = None
+    stranger_prompted_at = 0.0
+    stranger_declined = False
+    stranger_declined_at = 0.0
+    pending_face_enroll_user_id: str | None = None
+    pending_face_enroll_obs: Any | None = None
+    pending_face_enroll_at = 0.0
 
     def speak(
         media,
@@ -2411,6 +2557,121 @@ def run_robot() -> None:
                     )
                     continue
                 if gate_decision.wake_only:
+                    now_mono = time.monotonic()
+                    if stranger_declined and now_mono - stranger_declined_at > 180.0:
+                        stranger_declined = False
+                    wake_voice_match = precomputed_voice_match
+                    wake_voice_emb: np.ndarray | None = None
+                    if voice_audio.size:
+                        try:
+                            wake_voice_emb = voice_identifier.embedding(
+                                voice_audio, sample_rate
+                            )
+                        except ValueError:
+                            wake_voice_emb = None
+                        if wake_voice_match is None and wake_voice_emb is not None:
+                            try:
+                                wake_voice_match = voice_identifier.identify(
+                                    voice_audio, sample_rate
+                                )
+                            except Exception:
+                                wake_voice_match = None
+                    if wake_voice_match is None:
+                        wake_voice_match = Match(None, 0.0, "voice")
+                    wake_face_obs: list[Any] = []
+                    wake_face_matches: list[Match] = []
+                    wake_face_match = Match(None, 0.0, "face")
+                    try:
+                        wake_frame = reachy.media.get_frame_jpeg()
+                        if wake_frame:
+                            wake_face_obs = face_identifier.observe_all(wake_frame)
+                            wake_face_obs.sort(key=lambda item: item.center_distance)
+                            wake_face_matches = face_identifier.match_visible_faces(
+                                wake_face_obs
+                            )
+                            if wake_face_matches:
+                                wake_face_match = wake_face_matches[0]
+                    except Exception:
+                        wake_face_obs = []
+                        wake_face_matches = []
+                        wake_face_match = Match(None, 0.0, "face")
+                    wake_identity = resolve_speaker_identity(
+                        wake_voice_match,
+                        wake_face_matches,
+                        stabilizer=identity_stabilizer,
+                    )
+                    if (
+                        wake_identity.user_id
+                        or wake_voice_match.user_id
+                        or (
+                            len(wake_face_obs) == 1
+                            and wake_face_match.user_id
+                            and wake_face_match.confidence >= 0.50
+                        )
+                    ):
+                        awaiting_stranger_name = False
+                        pending_stranger_voice = None
+                        stranger_declined = False
+                        pending_face_enroll_user_id = None
+                        pending_face_enroll_obs = None
+                        known_uid = (
+                            wake_identity.user_id
+                            or wake_voice_match.user_id
+                            or wake_face_match.user_id
+                        )
+                        if wake_identity.user_id:
+                            brain.set_identity(
+                                wake_identity.user_id,
+                                private_memory_allowed=(
+                                    family_mode
+                                    or wake_identity.private_memory_allowed
+                                ),
+                                source=wake_identity.reason,
+                                confidence=wake_identity.confidence,
+                            )
+                        if known_uid and known_uid not in greeted_user_ids:
+                            greeted_user_ids.add(known_uid)
+                            startup_greeted = True
+                            speak(
+                                reachy.media,
+                                f"我在呢，{memory.user_name(known_uid)}，你说。",
+                                record_history=False,
+                            )
+                            continue
+                        speak(
+                            reachy.media,
+                            "我在呢，你说。",
+                            record_history=False,
+                        )
+                        continue
+                    if (
+                        is_unfamiliar_speaker(
+                            identity=wake_identity,
+                            voice_match=wake_voice_match,
+                            face_match=wake_face_match,
+                            face_observations=wake_face_obs,
+                            has_voice_embedding=(wake_voice_emb is not None),
+                            voice_templates_count=len(
+                                memory.biometric_templates("voice")
+                            ),
+                        )
+                        and not stranger_declined
+                        and (now_mono - stranger_prompted_at >= 15.0)
+                    ):
+                        brain.set_identity(None, private_memory_allowed=False)
+                        awaiting_stranger_name = True
+                        pending_stranger_voice = wake_voice_emb
+                        pending_face_enroll_user_id = None
+                        pending_face_enroll_obs = None
+                        stranger_prompted_at = now_mono
+                        startup_greeted = True
+                        brain.record_user(utterance)
+                        speak(
+                            reachy.media,
+                            "我在呢，好像还没认识你，请问你叫什么名字呀？",
+                            record_history=True,
+                        )
+                        continue
                     speak(
                         reachy.media,
                         "我在呢，你说。",
@@ -2618,7 +2879,26 @@ def run_robot() -> None:
             identity = resolve_speaker_identity(
                 voice_match, visible_matches, stabilizer=identity_stabilizer
             )
+            now_turn = time.monotonic()
+            if stranger_declined and now_turn - stranger_declined_at > 180.0:
+                stranger_declined = False
+            if awaiting_stranger_name and now_turn - stranger_prompted_at > 90.0:
+                awaiting_stranger_name = False
+                pending_stranger_voice = None
+            if pending_face_enroll_user_id and now_turn - pending_face_enroll_at > 90.0:
+                pending_face_enroll_user_id = None
+                pending_face_enroll_obs = None
+
             if identity.user_id:
+                awaiting_stranger_name = False
+                pending_stranger_voice = None
+                stranger_declined = False
+                if (
+                    pending_face_enroll_user_id
+                    and pending_face_enroll_user_id != identity.user_id
+                ):
+                    pending_face_enroll_user_id = None
+                    pending_face_enroll_obs = None
                 brain.set_identity(
                     identity.user_id,
                     private_memory_allowed=(family_mode or identity.private_memory_allowed),
@@ -2678,6 +2958,99 @@ def run_robot() -> None:
                     print(message)
                     speak(reachy.media, message)
                     startup_greeted = True
+
+            if pending_face_enroll_user_id:
+                target_uid = pending_face_enroll_user_id
+                target_name = memory.user_name(target_uid)
+                if is_affirmative_face_enroll_reply(utterance) or FACE_ENROLL_REQUEST.search(
+                    utterance
+                ):
+                    pending_face_enroll_user_id = None
+                    saved_obs = pending_face_enroll_obs
+                    pending_face_enroll_obs = None
+                    if len(face_observations) > 1:
+                        speak(
+                            reachy.media,
+                            "现在画面里有多张脸，录入人脸时请只让你自己入镜再说一次‘记住我的脸’。",
+                        )
+                        continue
+                    chosen_face = None
+                    if len(face_observations) == 1:
+                        if face_match.user_id and face_match.user_id != target_uid:
+                            speak(
+                                reachy.media,
+                                f"画面里这张脸已经绑定在{memory.user_name(face_match.user_id)}名下了，"
+                                "所以我没有写入；请只让你自己面对摄像头再说一次‘记住我的脸’。",
+                            )
+                            continue
+                        chosen_face = face_observations[0]
+                    elif saved_obs is not None:
+                        chosen_face = saved_obs
+                    else:
+                        speak(
+                            reachy.media,
+                            "现在画面里没有检测到正脸，请面对摄像头再说一次‘记住我的脸’。",
+                        )
+                        continue
+                    memory.add_biometric(
+                        target_uid,
+                        "face",
+                        chosen_face.embedding,
+                        quality=chosen_face.quality,
+                    )
+                    if (
+                        saved_obs is not None
+                        and saved_obs is not chosen_face
+                        and float(np.dot(saved_obs.embedding, chosen_face.embedding))
+                        >= 0.50
+                    ):
+                        memory.add_biometric(
+                            target_uid,
+                            "face",
+                            saved_obs.embedding,
+                            quality=saved_obs.quality,
+                        )
+                    memory.add_episode(
+                        target_uid,
+                        f"在初次认识时确认绑定人脸特征：{target_name}",
+                        importance=0.90,
+                    )
+                    brain.set_identity(
+                        target_uid,
+                        private_memory_allowed=family_mode,
+                        source="face-confirmed",
+                        confidence=float(chosen_face.quality),
+                    )
+                    message = (
+                        f"好啦，{target_name}，你的名字、声纹和人脸都已经保存进资料库了，"
+                        "下次见到你或听到你的声音我就能认出你。"
+                    )
+                    print(message)
+                    speak(reachy.media, message)
+                    continue
+                if is_negative_face_enroll_reply(utterance):
+                    pending_face_enroll_user_id = None
+                    pending_face_enroll_obs = None
+                    message = (
+                        f"没关系，{target_name}，那就先只记住你的名字和声音，以后想录人脸再跟我说。"
+                    )
+                    print(message)
+                    speak(reachy.media, message)
+                    continue
+                pending_face_enroll_user_id = None
+                pending_face_enroll_obs = None
+
+            introduced_name = extract_self_introduced_name(utterance)
+            if introduced_name is None and awaiting_stranger_name:
+                if is_stranger_name_refusal(utterance):
+                    awaiting_stranger_name = False
+                    pending_stranger_voice = None
+                    stranger_declined = True
+                    stranger_declined_at = now_turn
+                    speak(reachy.media, "没关系，那我不追问啦，你想聊什么都可以。")
+                    continue
+                introduced_name = extract_stranger_reply_name(utterance)
+                awaiting_stranger_name = False
 
             if VOICE_MATCH_RESULT_QUESTION.search(utterance):
                 if voice_match.user_id:
@@ -2771,7 +3144,6 @@ def run_robot() -> None:
                 speak(reachy.media, message)
                 continue
 
-            introduced_name = extract_self_introduced_name(utterance)
             if (
                 BIOMETRIC_CAPABILITY_QUESTION.search(utterance)
                 and not introduced_name
@@ -2977,11 +3349,20 @@ def run_robot() -> None:
                 continue
 
             if introduced_name:
+                awaiting_stranger_name = False
+                stranger_declined = False
+                fallback_voice = pending_stranger_voice if not identity.user_id else None
+                pending_stranger_voice = None
                 try:
                     voice_embedding = voice_identifier.embedding(voice_audio, sample_rate)
                 except ValueError:
                     voice_embedding = None
-                if voice_embedding is None:
+                effective_voice = (
+                    voice_embedding if voice_embedding is not None else fallback_voice
+                )
+                if effective_voice is None:
+                    awaiting_stranger_name = True
+                    stranger_prompted_at = time.monotonic()
                     message = (
                         f"我听到你说名字是{introduced_name}，但这段声音不足以生成可靠声纹。"
                         "请再完整说一次‘我叫某某’。"
@@ -3007,8 +3388,15 @@ def run_robot() -> None:
                     and memory.user_name(voice_match.user_id) == introduced_name
                 ):
                     confirmed_identity = voice_match.user_id
+                if (
+                    confirmed_identity is None
+                    and len(face_observations) == 1
+                    and face_match.user_id
+                    and memory.user_name(face_match.user_id) == introduced_name
+                ):
+                    confirmed_identity = face_match.user_id
                 user_id = confirmed_identity or conversational_user_id(
-                    memory, introduced_name, voice_embedding.tobytes()
+                    memory, introduced_name, effective_voice.tobytes()
                 )
                 if confirmed_identity:
                     memory.rename_user(confirmed_identity, introduced_name)
@@ -3017,19 +3405,69 @@ def run_robot() -> None:
                     memory.remember_official_fact(
                         user_id, f"The user prefers to be called {introduced_name}."
                     )
-                memory.add_biometric(user_id, "voice", voice_embedding, quality=1.0)
+                memory.add_biometric(user_id, "voice", effective_voice, quality=1.0)
+                if (
+                    voice_embedding is not None
+                    and fallback_voice is not None
+                    and float(np.dot(voice_embedding, fallback_voice)) >= 0.45
+                ):
+                    memory.add_biometric(user_id, "voice", fallback_voice, quality=0.9)
                 default_profile(user_id)
                 memory.add_episode(
                     user_id,
                     f"首次在自然对话中自我介绍并绑定声纹：{introduced_name}",
                     importance=0.95,
                 )
-                brain.set_identity(user_id, private_memory_allowed=True)
-                message = (
-                    f"好的，{introduced_name}，我已经把名字和这次声纹绑定到同一个身份。"
-                    "我不会顺手把镜头中央的人脸算到你名下；如果要录入你的脸，"
-                    "面对摄像头说‘记住我的脸’。"
+                greeted_user_ids.add(user_id)
+                startup_greeted = True
+                brain.set_identity(
+                    user_id,
+                    private_memory_allowed=family_mode,
+                    source="voice-confirmed",
+                    confidence=1.0,
                 )
+                if (
+                    FACE_ENROLL_REQUEST.search(utterance)
+                    and len(face_observations) == 1
+                    and (not face_match.user_id or face_match.user_id == user_id)
+                ):
+                    target_face = face_observations[0]
+                    memory.add_biometric(
+                        user_id,
+                        "face",
+                        target_face.embedding,
+                        quality=target_face.quality,
+                    )
+                    memory.add_episode(
+                        user_id,
+                        f"在自我介绍时同步绑定人脸特征：{introduced_name}",
+                        importance=0.95,
+                    )
+                    message = (
+                        f"好的，{introduced_name}，我已经把你的名字、声纹和人脸特征一起保存到资料库了。"
+                    )
+                elif len(face_observations) == 1 and not face_match.user_id:
+                    pending_face_enroll_user_id = user_id
+                    pending_face_enroll_obs = face_observations[0]
+                    pending_face_enroll_at = time.monotonic()
+                    message = (
+                        f"好的，{introduced_name}，我已经把你的名字和声音保存进资料库了。"
+                        "看你现在正对着摄像头，需要顺便把你的样子也记住吗？"
+                    )
+                elif len(face_observations) == 1 and face_match.user_id == user_id:
+                    message = (
+                        f"好的，{introduced_name}，你的名字、声纹和人脸都已经对应保存好了。"
+                    )
+                elif len(face_observations) > 1:
+                    message = (
+                        f"好的，{introduced_name}，我已经把你的名字和声音保存进资料库了。"
+                        "现在画面里不止一个人，如果要录入你的脸，请单独面对摄像头对我说‘记住我的脸’。"
+                    )
+                else:
+                    message = (
+                        f"好的，{introduced_name}，我已经把你的名字和声音保存进资料库了。"
+                        "如果你想让我也记住你的样子，可以面向摄像头对我说‘记住我的脸’。"
+                    )
                 print(message)
                 speak(reachy.media, message)
                 announce_daily(reachy.media)
@@ -3169,6 +3607,48 @@ def run_robot() -> None:
                             else:
                                 deferred_face_capture = True
                                 deferred_face_replace = replace
+            music_stop = bool(route.get("music_stop"))
+            music_title = route.get("music_title")
+            music_artist = route.get("music_artist")
+            singing_lyrics = route.get("singing")
+            if (
+                not music_stop
+                and not music_title
+                and not singing_lyrics
+                and not clear_biometrics
+                and not update_biometrics
+                and not awaiting_stranger_name
+                and not pending_face_enroll_user_id
+                and not stranger_declined
+                and time.monotonic() - stranger_prompted_at >= 120.0
+            ):
+                stranger_voice_emb = None
+                if not identity.user_id and not voice_match.user_id and voice_audio.size:
+                    try:
+                        stranger_voice_emb = voice_identifier.embedding(
+                            voice_audio, sample_rate
+                        )
+                    except ValueError:
+                        stranger_voice_emb = None
+                if is_unfamiliar_speaker(
+                    identity=identity,
+                    voice_match=voice_match,
+                    face_match=face_match,
+                    face_observations=face_observations,
+                    has_voice_embedding=(stranger_voice_emb is not None),
+                    voice_templates_count=len(memory.biometric_templates("voice")),
+                ):
+                    awaiting_stranger_name = True
+                    pending_stranger_voice = stranger_voice_emb
+                    stranger_prompted_at = time.monotonic()
+                    if not re.search(r"叫什么名字|怎么称呼|你叫什么", reply):
+                        reply = (
+                            f"{reply.rstrip()} "
+                            "对了，我还不知道怎么称呼你，请问你叫什么名字呀？"
+                        ).strip()
+                        if brain.history and brain.history[-1].get("role") == "assistant":
+                            brain.history[-1]["content"] = reply
+                            brain._save_history()
             print(f"Reachy[{active_model}]：{reply}")
             actions = route.get("actions", [])
             if actions:
@@ -3184,10 +3664,6 @@ def run_robot() -> None:
                     print(f"Emotion: {', '.join(emotions)}")
                 except Exception as exc:
                     print(f"表情执行失败：{exc}")
-            music_stop = bool(route.get("music_stop"))
-            music_title = route.get("music_title")
-            music_artist = route.get("music_artist")
-            singing_lyrics = route.get("singing")
             if music_stop:
                 if netease_music.stop():
                     print("NetEase Music: stopped")
